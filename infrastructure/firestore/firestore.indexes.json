@@ -1,0 +1,13 @@
+{
+  "indexes": [
+    { "collectionGroup": "employees", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "companyId", "order": "ASCENDING" }, { "fieldPath": "status", "order": "ASCENDING" }, { "fieldPath": "updatedAt", "order": "DESCENDING" }] },
+    { "collectionGroup": "screenshots", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "companyId", "order": "ASCENDING" }, { "fieldPath": "employeeId", "order": "ASCENDING" }, { "fieldPath": "timestamp", "order": "DESCENDING" }] },
+    { "collectionGroup": "work_sessions", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "companyId", "order": "ASCENDING" }, { "fieldPath": "employeeId", "order": "ASCENDING" }, { "fieldPath": "startedAt", "order": "DESCENDING" }] },
+    { "collectionGroup": "idle_intervals", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "companyId", "order": "ASCENDING" }, { "fieldPath": "employeeId", "order": "ASCENDING" }, { "fieldPath": "startedAt", "order": "DESCENDING" }] },
+    { "collectionGroup": "activity_events", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "companyId", "order": "ASCENDING" }, { "fieldPath": "employeeId", "order": "ASCENDING" }, { "fieldPath": "startedAt", "order": "DESCENDING" }] },
+    { "collectionGroup": "alerts", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "companyId", "order": "ASCENDING" }, { "fieldPath": "createdAt", "order": "DESCENDING" }] },
+    { "collectionGroup": "devices", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "companyId", "order": "ASCENDING" }, { "fieldPath": "employeeId", "order": "ASCENDING" }, { "fieldPath": "lastHeartbeatAt", "order": "DESCENDING" }] },
+    { "collectionGroup": "notification_jobs", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "companyId", "order": "ASCENDING" }, { "fieldPath": "nextAttemptAt", "order": "ASCENDING" }] }
+  ],
+  "fieldOverrides": []
+}

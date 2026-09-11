@@ -1,0 +1,2 @@
+document.querySelector('form').addEventListener('submit',async event=>{event.preventDefault();const pairingSecret=document.querySelector('#secret').value.trim();await chrome.storage.local.set({pairingSecret});document.querySelector('#secret').value='';document.querySelector('#status').textContent='Pairing key saved. Keep the Windows agent running.';});
+document.querySelector('#disconnect').addEventListener('click',async()=>{await chrome.storage.local.remove('pairingSecret');document.querySelector('#status').textContent='Browser disconnected.';});

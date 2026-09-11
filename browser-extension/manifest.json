@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "120",
+  "name": "Workstream Activity Bridge",
+  "version": "0.2.0",
+  "description": "Shares only the active domain with your paired agent during Active Monitoring.",
+  "permissions": [
+    "tabs",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:43173/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "options_page": "options.html"
+}
