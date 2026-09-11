@@ -23,6 +23,10 @@ export { verifySecret } from "./repository.js";
 export async function employeeRoutes(app: FastifyInstance) {
   app.get("/downloads/WorkstreamSetup.exe/status", async () => ({ available: installerAvailable(), url: installerUrl() }));
   app.get("/downloads/WorkstreamSetup.exe",async (_request,reply)=>{
+    // In hosted environments the installer lives on the configured release/CDN.
+    // Redirect the browser there instead of looking for a build artifact inside
+    // the API container.
+    if(process.env.AGENT_DOWNLOAD_URL)return reply.redirect(process.env.AGENT_DOWNLOAD_URL);
     const file=installerPath();
     if(!existsSync(file)||!statSync(file).isFile())return reply.code(404).send({message:"WorkstreamSetup.exe is currently unavailable."});
     return reply.header("Content-Type","application/vnd.microsoft.portable-executable").header("Content-Disposition","attachment; filename=WorkstreamSetup.exe").header("Cache-Control","no-store, max-age=0").send(createReadStream(file));
