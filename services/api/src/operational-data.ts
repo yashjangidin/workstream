@@ -1,15 +1,52 @@
 import { db } from "./firebase.js";
 import { companyRecords } from "./repository.js";
-import { dailyTime, dayBounds, localDate, operationalStatus, targetStatus, milliseconds, type RecordedSession, type RecordedIdle } from "@workstream/domain";
+import { calculateTimeTotals, dailyTime, dayBounds, localDate, operationalStatus, targetStatus, milliseconds, type RecordedSession, type RecordedIdle } from "@workstream/domain";
 import { config } from "./config.js";
+
+async function reconcileStaleSessions(companyId:string,sessions:any[],devices:any[],now:number) {
+  const devicesById=new Map(devices.map(device=>[device.id,device]));
+  const closed=new Map<string,number>();
+  const stale=sessions.filter(session=>{
+    if(session.status!=="ACTIVE")return false;
+    const device=devicesById.get(session.deviceId),lastSeen=milliseconds(device?.lastHeartbeatAt);
+    return device?.status==="REVOKED"||!Number.isFinite(lastSeen)||now-lastSeen>config.OFFLINE_TIMEOUT*1000;
+  });
+  await Promise.all(stale.map(async candidate=>{
+    await db.runTransaction(async tx=>{
+      const sessionRef=db.collection("work_sessions").doc(candidate.id);
+      const [sessionDoc,employeeDoc,deviceDoc,idleDocs]=await Promise.all([
+        tx.get(sessionRef),
+        tx.get(db.collection("employees").doc(candidate.employeeId)),
+        tx.get(db.collection("devices").doc(candidate.deviceId)),
+        tx.get(db.collection("idle_intervals").where("sessionId","==",candidate.id))
+      ]);
+      const session=sessionDoc.data(),device=deviceDoc.data();
+      if(!session||session.status!=="ACTIVE"||session.companyId!==companyId)return;
+      const lastSeen=milliseconds(device?.lastHeartbeatAt);
+      if(device?.status!=="REVOKED"&&Number.isFinite(lastSeen)&&now-lastSeen<=config.OFFLINE_TIMEOUT*1000)return;
+      // Never create time after the last confirmed device heartbeat.
+      const stoppedAt=Math.max(milliseconds(session.startedAt),Math.min(now,Number.isFinite(lastSeen)?lastSeen:milliseconds(session.startedAt)));
+      const intervals=idleDocs.docs.map(doc=>{const idle=doc.data();return {startedAt:new Date(idle.startedAt),endedAt:new Date(idle.endedAt??stoppedAt)};});
+      const totals=calculateTimeTotals({startedAt:new Date(session.startedAt),endedAt:new Date(stoppedAt)},intervals);
+      for(const idle of idleDocs.docs)if(!idle.data().endedAt)tx.update(idle.ref,{endedAt:stoppedAt});
+      tx.update(sessionRef,{status:"COMPLETED",stoppedAt,...totals,updatedAt:now,closedBy:"STALE_DEVICE_TIMEOUT"});
+      if(deviceDoc.exists)tx.update(deviceDoc.ref,{timerState:"STOPPED"});
+      if(employeeDoc.data()?.activeSessionId===candidate.id)tx.update(employeeDoc.ref,{activeSessionId:null});
+      closed.set(candidate.id,stoppedAt);
+    });
+  }));
+  return closed;
+}
 
 export async function operationalData(companyId: string, date?: string) {
   const company = (await db.collection("companies").doc(companyId).get()).data()!;
   const timezone = company.timezone || "UTC", now = Date.now(), selected = date || localDate(now,timezone);
   const {start,end} = dayBounds(selected,timezone);
   const [employees,sessions,idle,devices,activity,alerts,adjustments] = await Promise.all(["employees","work_sessions","idle_intervals","devices","activity_events","alerts","time_adjustments"].map(c => companyRecords(c,companyId)));
+  const staleClosures=await reconcileStaleSessions(companyId,sessions,devices,now);
+  const reportingSessions=sessions.map(session=>staleClosures.has(session.id)?{...session,status:"COMPLETED",stoppedAt:staleClosures.get(session.id)!}:session);
   const rows = employees.filter(e=>e.status !== "DELETED").map(employee => {
-    const ownSessions = sessions.filter(s=>s.employeeId===employee.id).map(s=>{const adjustment=adjustments.find(a=>a.sessionId===s.id);return adjustment?{...s,startedAt:adjustment.startedAt,stoppedAt:adjustment.stoppedAt}:s;});
+    const ownSessions = reportingSessions.filter(s=>s.employeeId===employee.id).map(s=>{const adjustment=adjustments.find(a=>a.sessionId===s.id);return adjustment?{...s,startedAt:adjustment.startedAt,stoppedAt:adjustment.stoppedAt}:s;});
     for(const a of adjustments.filter(a=>a.employeeId===employee.id&&!a.sessionId))ownSessions.push({...a,status:'COMPLETED',deviceId:'MANUAL',id:a.id});
     const ownIdle = idle.filter(i=>i.employeeId===employee.id);
     const active = ownSessions.find(s=>s.status==="ACTIVE");

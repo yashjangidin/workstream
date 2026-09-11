@@ -9,11 +9,17 @@ using Microsoft.Data.Sqlite;
 
 namespace Workstream.Agent;
 
+internal static class Deployment {
+    // Release builds always connect to the hosted API. A local API address is
+    // only appropriate when explicitly supplied by a development build.
+    public const string ApiUrl="https://workstream-api-tlk3.onrender.com";
+}
+
 internal static class Program {
     [STAThread] static void Main() { ApplicationConfiguration.Initialize(); using var mutex=new Mutex(true,"Local\\WorkstreamEmployeeAgent",out var first); if(!first)return; Application.Run(new AgentForm()); }
 }
 internal sealed class State {
-    public string ApiUrl {get;set;}="http://127.0.0.1:8080";
+    public string ApiUrl {get;set;}=Deployment.ApiUrl;
     public string InstallationId {get;set;}=Guid.NewGuid().ToString("N");
     public string Credential {get;set;}="";
     public string DeviceId {get;set;}="";
@@ -55,7 +61,7 @@ internal sealed class Store : IDisposable {
     public void Dispose()=>connection.Dispose();
 }
 internal sealed class AgentForm:Form {
-    const string AgentVersion="0.2.6";
+    const string AgentVersion="0.2.7";
     const bool ScreenshotUploadsEnabled=false;
     readonly BrowserBridge bridge=new();
     readonly Button browserPair=new(){Text="Copy browser pairing key",Width=320},correction=new(){Text="Request time correction",Width=320};
@@ -73,6 +79,9 @@ internal sealed class AgentForm:Form {
     static long Now=>DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     public AgentForm(){
         state=store.Load();
+        // Migrate unpaired installations created by the local-development
+        // build. They should never require a person to replace localhost.
+        if(state.DeviceId==""&&state.ApiUrl=="http://127.0.0.1:8080"){state.ApiUrl=Deployment.ApiUrl;store.Save(state);}
         if(!ScreenshotUploadsEnabled)store.DiscardScreenshotUploads();
         authorization=state.DeviceId==""?AuthorizationStatus.SetupRequired:AuthorizationStatus.Connecting;
         BuildWindow();
@@ -130,7 +139,7 @@ internal sealed class AgentForm:Form {
         return JsonDocument.Parse(text).RootElement.Clone();
     }
     bool CanOperate()=>AuthorizationGate.CanOperate(authorization,state.DeviceId,state.LastAuthorizedAt,Now)&&!closing;
-    void ClearAuthorizationState(){state.Credential="";state.DeviceId="";state.EmployeeName="";state.BrowserSecret=Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));state.Timezone="UTC";state.RequiredDailySeconds=28800;state.IdleThresholdSeconds=30;state.MonitoringMode="SIMPLE_TIMER";state.SessionId=null;state.StartedAt=0;state.IdleId=null;state.IdleStartedAt=0;state.IdleMilliseconds=0;state.LastAuthorizedAt=0;state.TimerStateChangedAt=0;application="";activeDomain="";activityAt=0;lastCapture=0;bridge.Enabled=false;}
+    void ClearAuthorizationState(){state.ApiUrl=Deployment.ApiUrl;state.Credential="";state.DeviceId="";state.EmployeeName="";state.BrowserSecret=Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));state.Timezone="UTC";state.RequiredDailySeconds=28800;state.IdleThresholdSeconds=30;state.MonitoringMode="SIMPLE_TIMER";state.SessionId=null;state.StartedAt=0;state.IdleId=null;state.IdleStartedAt=0;state.IdleMilliseconds=0;state.LastAuthorizedAt=0;state.TimerStateChangedAt=0;application="";activeDomain="";activityAt=0;lastCapture=0;bridge.Enabled=false;}
     void Revoke(string reason){authorization=AuthorizationStatus.Revoked;ClearAuthorizationState();store.ResetAuthorization(state);authorization=AuthorizationStatus.SetupRequired;warning.Text=reason+" Connect this computer using a new employee setup code.";Render();}
     async Task RevalidateAuthorization(){if(state.DeviceId==""||state.Credential=="")return;authorization=AuthorizationStatus.Connecting;Render();await Sync();}
     async Task Toggle(){
