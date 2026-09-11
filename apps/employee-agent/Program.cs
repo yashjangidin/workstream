@@ -28,6 +28,7 @@ internal sealed class State {
     public string Timezone {get;set;}="UTC";
     public int RequiredDailySeconds {get;set;}=28800;
     public int IdleThresholdSeconds {get;set;}=30;
+    public int HeartbeatSeconds {get;set;}=60;
     public string MonitoringMode {get;set;}="SIMPLE_TIMER";
     public string? SessionId {get;set;}
     public long StartedAt {get;set;}
@@ -61,11 +62,11 @@ internal sealed class Store : IDisposable {
     public void Dispose()=>connection.Dispose();
 }
 internal sealed class AgentForm:Form {
-    const string AgentVersion="0.2.7";
+    const string AgentVersion="0.2.8";
     const bool ScreenshotUploadsEnabled=false;
     readonly BrowserBridge bridge=new();
     readonly Button browserPair=new(){Text="Copy browser pairing key",Width=320},correction=new(){Text="Request time correction",Width=320};
-    readonly Store store=new(); readonly State state; readonly HttpClient http=new(){Timeout=TimeSpan.FromSeconds(20)};
+    readonly Store store=new(); readonly State state; readonly HttpClient http=new(){Timeout=TimeSpan.FromSeconds(90)};
     readonly Label name=new(){AutoSize=true}, status=new(){AutoSize=true}, timerLabel=new(){AutoSize=true,Font=new Font("Segoe UI",17,FontStyle.Bold)}, monitoring=new(){AutoSize=true,MaximumSize=new Size(340,0)}, warning=new(){AutoSize=true,MaximumSize=new Size(340,0)};
     readonly TextBox url=new(){Width=320},code=new(){Width=320,PlaceholderText="Employee setup code",UseSystemPasswordChar=true};
     readonly Button pair=new(){Text="Connect",Width=320},toggle=new(){Text="START TIMER",Width=320,Height=40};
@@ -74,7 +75,7 @@ internal sealed class AgentForm:Form {
     readonly System.Windows.Forms.Timer tick=new(){Interval=1000};
     readonly NotifyIcon trayIcon=new();
     Icon? appIcon;
-    const long AuthorizationPollMilliseconds=5000;
+    long SyncIntervalMilliseconds=>Math.Max(30,state.HeartbeatSeconds)*1000L;
     bool syncing=false,closing=false,closed=false; AuthorizationStatus authorization; int rejected=0;long lastSync=0,lastCapture=0,activityAt=0;string application="",activeDomain="";
     static long Now=>DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     public AgentForm(){
@@ -139,7 +140,7 @@ internal sealed class AgentForm:Form {
         return JsonDocument.Parse(text).RootElement.Clone();
     }
     bool CanOperate()=>AuthorizationGate.CanOperate(authorization,state.DeviceId,state.LastAuthorizedAt,Now)&&!closing;
-    void ClearAuthorizationState(){state.ApiUrl=Deployment.ApiUrl;state.Credential="";state.DeviceId="";state.EmployeeName="";state.BrowserSecret=Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));state.Timezone="UTC";state.RequiredDailySeconds=28800;state.IdleThresholdSeconds=30;state.MonitoringMode="SIMPLE_TIMER";state.SessionId=null;state.StartedAt=0;state.IdleId=null;state.IdleStartedAt=0;state.IdleMilliseconds=0;state.LastAuthorizedAt=0;state.TimerStateChangedAt=0;application="";activeDomain="";activityAt=0;lastCapture=0;bridge.Enabled=false;}
+    void ClearAuthorizationState(){state.ApiUrl=Deployment.ApiUrl;state.Credential="";state.DeviceId="";state.EmployeeName="";state.BrowserSecret=Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));state.Timezone="UTC";state.RequiredDailySeconds=28800;state.IdleThresholdSeconds=30;state.HeartbeatSeconds=60;state.MonitoringMode="SIMPLE_TIMER";state.SessionId=null;state.StartedAt=0;state.IdleId=null;state.IdleStartedAt=0;state.IdleMilliseconds=0;state.LastAuthorizedAt=0;state.TimerStateChangedAt=0;application="";activeDomain="";activityAt=0;lastCapture=0;bridge.Enabled=false;}
     void Revoke(string reason){authorization=AuthorizationStatus.Revoked;ClearAuthorizationState();store.ResetAuthorization(state);authorization=AuthorizationStatus.SetupRequired;warning.Text=reason+" Connect this computer using a new employee setup code.";Render();}
     async Task RevalidateAuthorization(){if(state.DeviceId==""||state.Credential=="")return;authorization=AuthorizationStatus.Connecting;Render();await Sync();}
     async Task Toggle(){
@@ -160,9 +161,9 @@ internal sealed class AgentForm:Form {
     void FlushActivity(){if(CanOperate()&&state.SessionId!=null&&state.MonitoringMode=="ACTIVE_MONITORING"&&activityAt>0&&Now>activityAt)store.Add("/v1/device/activity",new{operationId=Guid.NewGuid().ToString("N"),sessionId=state.SessionId,at=activityAt,endedAt=Now,application,domain=activeDomain});activityAt=Now;}
     async Task Tick(){
         if(closing){Render();return;}
-        if(!CanOperate()){Render();if(!syncing&&state.DeviceId!=""&&authorization!=AuthorizationStatus.SetupRequired&&Now-lastSync>=AuthorizationPollMilliseconds){lastSync=Now;await Sync();}return;}
+        if(!CanOperate()){Render();if(!syncing&&state.DeviceId!=""&&authorization!=AuthorizationStatus.SetupRequired&&Now-lastSync>=SyncIntervalMilliseconds){lastSync=Now;await Sync();}return;}
         if(state.SessionId!=null){var idleFor=IdleMilliseconds();if(idleFor>=state.IdleThresholdSeconds*1000L&&state.IdleId==null){store.Atomic(()=>{state.IdleId=Guid.NewGuid().ToString("N");state.IdleStartedAt=Math.Max(state.StartedAt,Now-idleFor);store.Add("/v1/device/idle",new{operationId=Guid.NewGuid().ToString("N"),sessionId=state.SessionId,idleId=state.IdleId,at=state.IdleStartedAt,endedAt=(long?)null});store.Save(state);});}else if(idleFor<1000&&state.IdleId!=null){store.Atomic(()=>{CloseIdle();store.Save(state);});}if(state.MonitoringMode=="ACTIVE_MONITORING"){var foreground=Foreground();var domain=BrowserDomain(foreground);if(foreground!=application||domain!=activeDomain||Now-activityAt>=15000){FlushActivity();application=foreground;activeDomain=domain;}if(ScreenshotUploadsEnabled&&Now-lastCapture>=30000){lastCapture=Now;CaptureScreenshot();}}}
-        Render();if(!syncing&&state.DeviceId!=""&&Now-lastSync>=AuthorizationPollMilliseconds){lastSync=Now;await Sync();}
+        Render();if(!syncing&&state.DeviceId!=""&&Now-lastSync>=SyncIntervalMilliseconds){lastSync=Now;await Sync();}
     }
     void CaptureScreenshot(){try{if(!CanOperate()||state.SessionId==null||state.MonitoringMode!="ACTIVE_MONITORING")return;var size=Directory.EnumerateFiles(store.DirectoryPath,"*.capture").Sum(p=>new FileInfo(p).Length);if(size>250L*1024*1024){warning.Text="Screenshot queue is full. Unsent images are retained; capture resumes after sync and cleanup.";return;}var bounds=Screen.PrimaryScreen!.Bounds;using var bitmap=new Bitmap(bounds.Width,bounds.Height);using(var graphics=Graphics.FromImage(bitmap))graphics.CopyFromScreen(bounds.Location,Point.Empty,bounds.Size);var path=Path.Combine(store.DirectoryPath,Guid.NewGuid().ToString("N")+".capture");var codec=ImageCodecInfo.GetImageEncoders().First(c=>c.MimeType=="image/jpeg");using var parameters=new EncoderParameters(1);parameters.Param[0]=new EncoderParameter(System.Drawing.Imaging.Encoder.Quality,55L);using var stream=new MemoryStream();bitmap.Save(stream,codec,parameters);File.WriteAllBytes(path,ProtectedData.Protect(stream.ToArray(),null,DataProtectionScope.CurrentUser));store.Add("/v1/device/screenshots",new{operationId=Guid.NewGuid().ToString("N"),sessionId=state.SessionId,at=Now,application,domain=BrowserDomain(application)},path);}catch{warning.Text="Screenshot capture failed. Timer continues.";}}
     async Task Sync(){
@@ -170,7 +171,7 @@ internal sealed class AgentForm:Form {
         try{
             await Send("/v1/device/heartbeat",HttpMethod.Post,JsonSerializer.Serialize(new{agentVersion=AgentVersion,timerState=state.SessionId==null?"STOPPED":"RUNNING",timerStateAt=state.TimerStateChangedAt>0?state.TimerStateChangedAt:Now}));
             var conf=await Send("/v1/device/config",HttpMethod.Get);var mode=conf.GetProperty("monitoringMode").GetString()!;
-            if(mode!=state.MonitoringMode){activityAt=Now;lastCapture=Now;}state.MonitoringMode=mode;state.EmployeeName=conf.GetProperty("employeeName").GetString()!;state.IdleThresholdSeconds=conf.GetProperty("idleThresholdSeconds").GetInt32();state.RequiredDailySeconds=conf.GetProperty("requiredDailySeconds").GetInt32();state.Timezone=conf.GetProperty("timezone").GetString()!;state.LastAuthorizedAt=Now;authorization=AuthorizationStatus.Authorized;store.Save(state);
+            if(mode!=state.MonitoringMode){activityAt=Now;lastCapture=Now;}state.MonitoringMode=mode;state.EmployeeName=conf.GetProperty("employeeName").GetString()!;state.IdleThresholdSeconds=conf.GetProperty("idleThresholdSeconds").GetInt32();state.RequiredDailySeconds=conf.GetProperty("requiredDailySeconds").GetInt32();state.HeartbeatSeconds=conf.GetProperty("heartbeatSeconds").GetInt32();state.Timezone=conf.GetProperty("timezone").GetString()!;state.LastAuthorizedAt=Now;authorization=AuthorizationStatus.Authorized;store.Save(state);
             var monitoringRetry=false;
             for(var count=0;count<50;count++){
                 var item=store.First();if(item==null)break;var body=item.Value.Body;
@@ -181,6 +182,7 @@ internal sealed class AgentForm:Form {
             }
             store.Cleanup();warning.Text=monitoringRetry?"Screenshot delivery is retrying. Your timer and work-time data are synced.":rejected>0?$"{rejected} monitoring record(s) were rejected by server policy. Timer sync continues.":"";
         }catch(DeviceAuthorizationException e){Revoke(e.Message);}
+        catch(TaskCanceledException){if(authorization!=AuthorizationStatus.SetupRequired){authorization=AuthorizationStatus.Offline;warning.Text="Connecting to Workstream is taking longer than usual. Retrying automatically.";}}
         catch(Exception e){if(authorization!=AuthorizationStatus.SetupRequired){authorization=AuthorizationStatus.Offline;warning.Text="Offline · retrying. "+e.Message;}}
         finally{syncing=false;Render();}
     }
