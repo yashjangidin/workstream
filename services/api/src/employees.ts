@@ -5,6 +5,7 @@ import { requireEmployer } from "./security.js";
 import { employeeInput, id, dateInput } from "./schemas.js";
 import { newCode, digest, hashSecret, clean, owned, audit, fail } from "./repository.js";
 import { operationalData } from "./operational-data.js";
+import { dashboardSummary, invalidateDashboardSummary } from "./dashboard-summary.js";
 import {encrypt,decrypt,notificationRecord,deliver} from "./notifications.js";
 import { createReadStream } from "node:fs";
 import { existsSync, statSync } from "node:fs";
@@ -33,7 +34,7 @@ export async function employeeRoutes(app: FastifyInstance) {
   });
   app.get("/v1/app/overview",async request=>{
     const actor=await requireEmployer(request), query=z.object({date:dateInput.optional()}).parse(request.query);
-    return clean(await operationalData(actor.companyId,query.date));
+    return clean(await dashboardSummary(actor.companyId,query.date));
   });
   app.get("/v1/employees",async request=>{
     const actor=await requireEmployer(request);
@@ -62,6 +63,7 @@ export async function employeeRoutes(app: FastifyInstance) {
       tx.create(db.collection("audit_logs").doc(),{companyId:actor.companyId,actorUserId:actor.uid,action:"EMPLOYEE_CREATED",targetId:employee.id,createdAt:Date.now()});
     });
     await deliver(invitation);
+    await invalidateDashboardSummary(actor.companyId);
     return reply.code(201).send({employeeId:employee.id,employeeName:value.fullName,setupCode:code,downloadUrl:installerUrl(),invitationStatus:(await invitation.get()).data()?.status});
   });
   app.patch("/v1/employees/:employeeId",async request=>{
@@ -73,7 +75,7 @@ export async function employeeRoutes(app: FastifyInstance) {
       if(!current||current.status!=="ACTIVE")fail(404,"Employee not found.");
       tx.update(record.ref,{...value,updatedAt:Date.now()});
       tx.create(db.collection("audit_logs").doc(),{companyId:actor.companyId,actorUserId:actor.uid,action:"EMPLOYEE_EDITED",targetId:employeeId,oldValue:clean(current),newValue:value,createdAt:Date.now()});
-    });return {saved:true};
+    });await invalidateDashboardSummary(actor.companyId);return {saved:true};
   });
   app.post("/v1/employees/:employeeId/setup-code",async request=>{
     const actor=await requireEmployer(request),employeeId=id.parse((request.params as {employeeId:string}).employeeId),record=await owned("employees",employeeId,actor.companyId),code=newCode(),key=digest(code);
@@ -105,6 +107,6 @@ export async function employeeRoutes(app: FastifyInstance) {
       for(const device of devices.docs)tx.update(device.ref,{status:"REVOKED",revokedAt:Date.now()});
       tx.delete(db.collection("email_claims").doc(current.email));
       tx.create(db.collection("audit_logs").doc(),{companyId:actor.companyId,actorUserId:actor.uid,action:"EMPLOYEE_DELETED",targetId:employeeId,createdAt:Date.now()});
-    });return reply.code(204).send();
+    });await invalidateDashboardSummary(actor.companyId);return reply.code(204).send();
   });
 }

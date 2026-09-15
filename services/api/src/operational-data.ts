@@ -60,7 +60,9 @@ export async function operationalData(companyId: string, date?: string) {
     // Activity is recorded as non-overlapping intervals; clip to the report day.
     let coveredUntil = start;
     for (const a of intervals) { const from=Math.max(start,coveredUntil,milliseconds(a.startedAt)), to=Math.min(end,now,milliseconds(a.endedAt)); if(to>from){ productivity[a.classification as keyof typeof productivity] += Math.floor((to-from)/1000); coveredUntil=to; } }
-    return { ...employee, ...time, ...operationalStatus(device as {status:string;lastHeartbeatAt?:unknown},!!active,!!ownIdle.find(i=>i.sessionId===active?.id&&!i.endedAt),now,config.OFFLINE_TIMEOUT), device:device??null, requiredSeconds, remainingSeconds:Math.max(0,requiredSeconds-time.effectiveSeconds), targetStatus:targetStatus(time.timerSeconds,time.effectiveSeconds,requiredSeconds,end,now), productivity, alertCount:alerts.filter(a=>a.employeeId===employee.id&&milliseconds(a.createdAt)>=start&&milliseconds(a.createdAt)<end).length };
+    // Never return the device credential hash to an employer browser.
+    const deviceSummary=device?{id:device.id,name:device.name,platform:device.platform,status:device.status,lastHeartbeatAt:device.lastHeartbeatAt,lastSyncAt:device.lastSyncAt,timerState:device.timerState,agentVersion:device.agentVersion}:null;
+    return { ...employee, ...time, ...operationalStatus(device as {status:string;lastHeartbeatAt?:unknown},!!active,!!ownIdle.find(i=>i.sessionId===active?.id&&!i.endedAt),now,config.OFFLINE_TIMEOUT), device:deviceSummary, requiredSeconds, remainingSeconds:Math.max(0,requiredSeconds-time.effectiveSeconds), targetStatus:targetStatus(time.timerSeconds,time.effectiveSeconds,requiredSeconds,end,now), productivity, alertCount:alerts.filter(a=>a.employeeId===employee.id&&milliseconds(a.createdAt)>=start&&milliseconds(a.createdAt)<end).length };
   });
   const todayAlerts = alerts.filter(a=>milliseconds(a.createdAt)>=start&&milliseconds(a.createdAt)<end);
   return { company:{id:companyId,name:company.name,timezone}, date:selected, generatedAt:now, employees:rows,

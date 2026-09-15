@@ -2,6 +2,8 @@ import type { FastifyRequest } from "fastify";
 import { auth, db } from "./firebase.js";
 import { config } from "./config.js";
 
+const employerMembershipCache=new Map<string,{companyId:string;expiresAt:number}>();
+
 export async function requireEmployer(request: FastifyRequest): Promise<{ uid: string; companyId: string }> {
   const bearer = request.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
   if (!bearer) throw Object.assign(new Error("Authentication required"), { statusCode: 401 });
@@ -13,8 +15,12 @@ export async function requireEmployer(request: FastifyRequest): Promise<{ uid: s
       : "Your session has expired. Please sign in again.";
     throw Object.assign(new Error(message), { statusCode: 401 });
   });
+  const cached=employerMembershipCache.get(token.uid);
+  if(cached&&cached.expiresAt>Date.now()) return {uid:token.uid,companyId:cached.companyId};
   const membership = await db.collection("memberships").doc(token.uid).get();
   const data = membership.data();
   if (!membership.exists || !data?.companyId || !["OWNER", "ADMIN"].includes(data.role)) throw Object.assign(new Error("Employer authorization required"), { statusCode: 403 });
-  return { uid: token.uid, companyId: data.companyId as string };
+  const companyId=data.companyId as string;
+  employerMembershipCache.set(token.uid,{companyId,expiresAt:Date.now()+10*60_000});
+  return { uid: token.uid, companyId };
 }

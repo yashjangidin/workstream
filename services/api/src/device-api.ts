@@ -6,6 +6,7 @@ import { id, ruleInput } from "./schemas.js";
 import { config } from "./config.js";
 import { classify, calculateTimeTotals, type Rule } from "@workstream/domain";
 import { companyRecords } from "./repository.js";
+import { addDashboardTime, patchDashboardEmployee } from "./dashboard-summary.js";
 
 function deviceFailure(code:"DEVICE_REVOKED"|"CREDENTIAL_INVALID"|"EMPLOYEE_DELETED"|"EMPLOYEE_DEACTIVATED",message:string): never {
   throw Object.assign(new Error(message),{statusCode:401,deviceCode:code});
@@ -48,7 +49,7 @@ export async function deviceRoutes(app:FastifyInstance) {
   app.post("/v1/device/heartbeat",async request=>{
     const d=await requireDevice(request);
     const body=z.object({agentVersion:z.string().max(30),timerState:z.enum(["RUNNING","STOPPED"]),timerStateAt:z.number().int().positive().refine(v=>v<=Date.now()+60000,"Timestamp is in the future.").optional()}).parse(request.body);
-    await db.runTransaction(async tx=>{
+    const stopped=await db.runTransaction(async tx=>{
       const [doc,employee]=await Promise.all([tx.get(d.ref),tx.get(d.employeeRef)]);
       if(doc.data()?.status==="REVOKED")deviceFailure("DEVICE_REVOKED","This device has been revoked.");
       const now=Date.now();
@@ -62,19 +63,22 @@ export async function deviceRoutes(app:FastifyInstance) {
       // the first write in a transaction.
       tx.update(d.ref,{lastHeartbeatAt:now,lastSyncAt:now,agentVersion:body.agentVersion,timerState:body.timerState});
       const s=session?.data();
-      if(!s||s.status!=="ACTIVE"||s.deviceId!==d.deviceId)return;
+      if(!s||s.status!=="ACTIVE"||s.deviceId!==d.deviceId)return null;
       const stoppedAt=Math.max(Number(s.startedAt),body.timerStateAt??now);
       const intervals=idle.docs.map((interval:any)=>{const value=interval.data();return {startedAt:new Date(value.startedAt),endedAt:new Date(value.endedAt??stoppedAt)};});
       const totals=calculateTimeTotals({startedAt:new Date(s.startedAt),endedAt:new Date(stoppedAt)},intervals);
       idle.docs.filter((interval:any)=>!interval.data().endedAt).forEach((interval:any)=>tx.update(interval.ref,{endedAt:stoppedAt}));
       tx.update(sessionRef,{stoppedAt,status:"COMPLETED",...totals,updatedAt:now,closedBy:"STOPPED_HEARTBEAT"});
       tx.update(d.employeeRef,{activeSessionId:null});
+      return totals;
     });
+    await patchDashboardEmployee(d.companyId,d.employeeId,{deviceStatus:"ONLINE",timerStatus:body.timerState,workStatus:body.timerState==="RUNNING"?"WORKING":"NOT_WORKING",device:{id:d.deviceId,name:d.data.name,platform:d.data.platform,status:"ACTIVE",lastHeartbeatAt:Date.now(),timerState:body.timerState,agentVersion:body.agentVersion}});
+    if(stopped) await addDashboardTime(d.companyId,d.employeeId,stopped);
     return {received:true};
   });
   app.post("/v1/device/sessions/start",async request=>{
     const d=await requireDevice(request), body=eventInput.parse(request.body), ref=db.collection("work_sessions").doc(body.sessionId);
-    return db.runTransaction(async tx=>{
+    const result=await db.runTransaction(async tx=>{
       const [old,employee,device]=await Promise.all([tx.get(ref),tx.get(d.employeeRef),tx.get(d.ref)]);
       if(employee.data()?.status==="DELETED")deviceFailure("EMPLOYEE_DELETED","This employee profile has been deleted.");
       if(employee.data()?.status!=="ACTIVE")deviceFailure("EMPLOYEE_DEACTIVATED","This employee profile is no longer active.");
@@ -85,6 +89,8 @@ export async function deviceRoutes(app:FastifyInstance) {
       tx.update(d.employeeRef,{activeSessionId:body.sessionId});tx.update(d.ref,{timerState:"RUNNING"});
       return {sessionId:body.sessionId};
     });
+    await patchDashboardEmployee(d.companyId,d.employeeId,{deviceStatus:"ONLINE",timerStatus:"RUNNING",workStatus:"WORKING",activeSessionStartedAt:body.at,device:{id:d.deviceId,name:d.data.name,platform:d.data.platform,status:"ACTIVE",lastHeartbeatAt:Date.now(),timerState:"RUNNING",agentVersion:d.data.agentVersion}});
+    return result;
   });
   app.post("/v1/device/idle",async request=>{
     const d=await requireDevice(request), body=eventInput.extend({idleId:id,endedAt:z.number().int().positive().nullable()}).parse(request.body);
@@ -102,7 +108,7 @@ export async function deviceRoutes(app:FastifyInstance) {
   });
   app.post("/v1/device/sessions/stop",async request=>{
     const d=await requireDevice(request), body=eventInput.parse(request.body), ref=db.collection("work_sessions").doc(body.sessionId);
-    return db.runTransaction(async tx=>{
+    const result=await db.runTransaction(async tx=>{
       const [session,device,idle]=await Promise.all([tx.get(ref),tx.get(d.ref),tx.get(db.collection("idle_intervals").where("sessionId","==",body.sessionId))]);const s=session.data();
       if(device.data()?.status==="REVOKED")deviceFailure("DEVICE_REVOKED","This device has been revoked.");
       if(!s||s.deviceId!==d.deviceId)fail(404,"Session not found.");
@@ -113,6 +119,8 @@ export async function deviceRoutes(app:FastifyInstance) {
       tx.update(ref,{stoppedAt:body.at,status:"COMPLETED",...totals,updatedAt:Date.now()});tx.update(d.employeeRef,{activeSessionId:null});tx.update(d.ref,{timerState:"STOPPED"});
       return {sessionId:body.sessionId,...totals};
     });
+    if("timerSeconds" in result) await addDashboardTime(d.companyId,d.employeeId,result as {timerSeconds:number;idleSeconds:number;effectiveSeconds:number});
+    return result;
   });
   app.post("/v1/device/activity",async request=>{
     const d=await requireDevice(request),body=eventInput.extend({endedAt:z.number().int().positive(),application:z.string().max(128),domain:z.string().max(255).optional()}).parse(request.body);
