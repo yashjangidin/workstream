@@ -171,7 +171,7 @@ internal sealed class AgentForm:Form {
         if(syncing)return; syncing=true;
         try{
             await Send("/v1/device/heartbeat",HttpMethod.Post,JsonSerializer.Serialize(new{agentVersion=AgentVersion,timerState=state.SessionId==null?"STOPPED":"RUNNING",timerStateAt=state.TimerStateChangedAt>0?state.TimerStateChangedAt:Now}));
-            var conf=await Send("/v1/device/config",HttpMethod.Get);var mode=conf.GetProperty("monitoringMode").GetString()!;
+            var conf=await Send("/v1/device/config",HttpMethod.Get);const string mode="SIMPLE_TIMER";
             if(mode!=state.MonitoringMode){activityAt=Now;lastCapture=Now;}state.MonitoringMode=mode;state.EmployeeName=conf.GetProperty("employeeName").GetString()!;state.IdleThresholdSeconds=conf.GetProperty("idleThresholdSeconds").GetInt32();state.RequiredDailySeconds=conf.GetProperty("requiredDailySeconds").GetInt32();state.HeartbeatSeconds=conf.GetProperty("heartbeatSeconds").GetInt32();state.Timezone=conf.GetProperty("timezone").GetString()!;state.LastAuthorizedAt=Now;authorization=AuthorizationStatus.Authorized;store.Save(state);
             var monitoringRetry=false;
             for(var count=0;count<50;count++){

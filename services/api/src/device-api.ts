@@ -53,7 +53,7 @@ export async function deviceRoutes(app:FastifyInstance) {
   });
   app.get("/v1/device/config",async request=>{
     const d=await requireDevice(request);
-    return {employeeName:d.employee.fullName,timezone:d.employee.timezone,requiredDailySeconds:d.employee.requiredDailySeconds,idleThresholdSeconds:d.employee.idleThresholdSeconds,monitoringMode:d.employee.monitoringMode,heartbeatSeconds:config.HEARTBEAT_INTERVAL,screenshotSeconds:30};
+    return {employeeName:d.employee.fullName,timezone:d.employee.timezone,requiredDailySeconds:d.employee.requiredDailySeconds,idleThresholdSeconds:d.employee.idleThresholdSeconds,monitoringMode:"SIMPLE_TIMER",heartbeatSeconds:config.HEARTBEAT_INTERVAL,screenshotSeconds:0};
   });
   app.post("/v1/device/heartbeat",async request=>{
     const d=await requireDevice(request);
