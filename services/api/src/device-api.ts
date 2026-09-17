@@ -89,7 +89,7 @@ export async function deviceRoutes(app:FastifyInstance) {
       tx.update(d.employeeRef,{activeSessionId:body.sessionId});tx.update(d.ref,{timerState:"RUNNING"});
       return {sessionId:body.sessionId};
     });
-    await patchDashboardEmployee(d.companyId,d.employeeId,{deviceStatus:"ONLINE",timerStatus:"RUNNING",workStatus:"WORKING",activeSessionStartedAt:body.at,device:{id:d.deviceId,name:d.data.name,platform:d.data.platform,status:"ACTIVE",lastHeartbeatAt:Date.now(),timerState:"RUNNING",agentVersion:d.data.agentVersion}});
+    await patchDashboardEmployee(d.companyId,d.employeeId,{deviceStatus:"ONLINE",timerStatus:"RUNNING",workStatus:"WORKING",activeSessionStartedAt:body.at,activeSessionSnapshotAt:Date.now(),device:{id:d.deviceId,name:d.data.name,platform:d.data.platform,status:"ACTIVE",lastHeartbeatAt:Date.now(),timerState:"RUNNING",agentVersion:d.data.agentVersion}});
     return result;
   });
   app.post("/v1/device/idle",async request=>{

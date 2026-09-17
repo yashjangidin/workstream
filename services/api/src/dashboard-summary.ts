@@ -12,7 +12,28 @@ function serialise(overview:any) {
     totals:overview.totals,alerts:overview.alerts};
 }
 
-function deserialise(value:any) { return {...value,employees:Object.values(value.employees??{})}; }
+function deserialise(value:any) {
+  const now=Date.now(), generatedAt=Number(value.generatedAt)||now;
+  const employees=Object.values(value.employees??{}).map((raw:any)=>{
+    const employee={...raw};
+    if(employee.timerStatus==="RUNNING"&&employee.activeSessionStartedAt){
+      // timerSeconds already contains time accrued at the snapshot. Only add
+      // time since that snapshot (or since this session was started).
+      const anchor=Math.max(generatedAt,Number(employee.activeSessionSnapshotAt)||Number(employee.activeSessionStartedAt));
+      const extra=Math.max(0,Math.floor((now-anchor)/1000));
+      employee.timerSeconds=(Number(employee.timerSeconds)||0)+extra;
+      employee.effectiveSeconds=(Number(employee.effectiveSeconds)||0)+extra;
+      employee.remainingSeconds=Math.max(0,(Number(employee.requiredSeconds)||0)-employee.effectiveSeconds);
+    }
+    return employee;
+  });
+  const count=(status:string)=>employees.filter((employee:any)=>employee.workStatus===status).length;
+  return {...value,employees,generatedAt:now,totals:{...value.totals,
+    employees:employees.length,working:count("WORKING"),idle:count("IDLE"),notWorking:count("NOT_WORKING"),offline:count("OFFLINE"),
+    timerSeconds:employees.reduce((sum:number,employee:any)=>sum+(Number(employee.timerSeconds)||0),0),
+    idleSeconds:employees.reduce((sum:number,employee:any)=>sum+(Number(employee.idleSeconds)||0),0),
+    effectiveSeconds:employees.reduce((sum:number,employee:any)=>sum+(Number(employee.effectiveSeconds)||0),0)}};
+}
 
 /** First visit seeds the compact document from existing data; later home-screen
  * refreshes read only this document. */
