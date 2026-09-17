@@ -7,7 +7,7 @@ import { operationalData } from "./operational-data.js";
 const refFor=(companyId:string)=>db.collection("dashboard_summaries").doc(companyId);
 
 function serialise(overview:any) {
-  return {summaryVersion:1,companyId:overview.company.id,company:overview.company,date:overview.date,
+  return {summaryVersion:2,companyId:overview.company.id,company:overview.company,date:overview.date,
     generatedAt:overview.generatedAt,employees:Object.fromEntries(overview.employees.map((employee:any)=>[employee.id,employee])),
     totals:overview.totals,alerts:overview.alerts};
 }
@@ -18,11 +18,23 @@ function deserialise(value:any) {
     const employee={...raw};
     if(employee.timerStatus==="RUNNING"&&employee.activeSessionStartedAt){
       // timerSeconds already contains time accrued at the snapshot. Only add
-      // time since that snapshot (or since this session was started).
+      // time since that snapshot (or since this session was started). Idle
+      // intervals for the live session are held in the same small document so
+      // the overview uses the exact same timer - idle calculation as reports.
       const anchor=Math.max(generatedAt,Number(employee.activeSessionSnapshotAt)||Number(employee.activeSessionStartedAt));
       const extra=Math.max(0,Math.floor((now-anchor)/1000));
+      const savedIntervals=Object.values(employee.liveIdleIntervals??{});
+      // A version-2 cache seeded during an already-open idle interval has no
+      // interval ID yet, so its explicit active-idle timestamp is the source.
+      const liveIntervals=savedIntervals.length?savedIntervals:(employee.activeIdleStartedAt?[{startedAt:employee.activeIdleStartedAt,endedAt:null}]:[]);
+      const liveIdleSeconds=liveIntervals.reduce((sum:number,rawInterval:any)=>{
+        const startedAt=Number(rawInterval?.startedAt), endedAt=rawInterval?.endedAt==null?now:Number(rawInterval.endedAt);
+        if(!Number.isFinite(startedAt)||!Number.isFinite(endedAt))return sum;
+        return sum+Math.max(0,Math.floor((Math.min(now,endedAt)-Math.max(anchor,startedAt))/1000));
+      },0);
       employee.timerSeconds=(Number(employee.timerSeconds)||0)+extra;
-      employee.effectiveSeconds=(Number(employee.effectiveSeconds)||0)+extra;
+      employee.idleSeconds=(Number(employee.idleSeconds)||0)+liveIdleSeconds;
+      employee.effectiveSeconds=(Number(employee.effectiveSeconds)||0)+Math.max(0,extra-liveIdleSeconds);
       employee.remainingSeconds=Math.max(0,(Number(employee.requiredSeconds)||0)-employee.effectiveSeconds);
     }
     return employee;
@@ -39,7 +51,7 @@ function deserialise(value:any) {
  * refreshes read only this document. */
 export async function dashboardSummary(companyId:string,date?:string) {
   const ref=refFor(companyId),snapshot=await ref.get(),value=snapshot.data();
-  if(value?.summaryVersion===1&&value.company&&(!date||value.date===date)) return deserialise(value);
+  if(value?.summaryVersion===2&&value.company&&(!date||value.date===date)) return deserialise(value);
   const overview=await operationalData(companyId,date);
   await ref.set(serialise(overview));
   return overview;
@@ -56,7 +68,7 @@ export async function addDashboardTime(companyId:string,employeeId:string,totals
   const increment=(value:number)=>FieldValue.increment(value);
   await refFor(companyId).set({companyId,updatedAt:Date.now(),employees:{[employeeId]:{
     timerSeconds:increment(totals.timerSeconds),idleSeconds:increment(totals.idleSeconds),effectiveSeconds:increment(totals.effectiveSeconds),
-    timerStatus:"STOPPED",workStatus:"NOT_WORKING",activeSessionStartedAt:null,activeIdleStartedAt:null
+    timerStatus:"STOPPED",workStatus:"NOT_WORKING",activeSessionStartedAt:null,activeIdleStartedAt:null,liveIdleIntervals:FieldValue.delete()
   }},totals:{timerSeconds:increment(totals.timerSeconds),idleSeconds:increment(totals.idleSeconds),effectiveSeconds:increment(totals.effectiveSeconds)}},{merge:true});
 }
 

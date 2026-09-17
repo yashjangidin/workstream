@@ -98,22 +98,28 @@ export async function deviceRoutes(app:FastifyInstance) {
       tx.update(d.employeeRef,{activeSessionId:body.sessionId});tx.update(d.ref,{timerState:"RUNNING"});
       return {sessionId:body.sessionId};
     });
-    await patchDashboardEmployee(d.companyId,d.employeeId,{deviceStatus:"ONLINE",timerStatus:"RUNNING",workStatus:"WORKING",activeSessionStartedAt:body.at,activeSessionSnapshotAt:Date.now(),device:{id:d.deviceId,name:d.data.name,platform:d.data.platform,status:"ACTIVE",lastHeartbeatAt:Date.now(),timerState:"RUNNING",agentVersion:d.data.agentVersion}});
+    await patchDashboardEmployee(d.companyId,d.employeeId,{deviceStatus:"ONLINE",timerStatus:"RUNNING",workStatus:"WORKING",activeSessionStartedAt:body.at,activeSessionSnapshotAt:Date.now(),activeIdleStartedAt:null,liveIdleIntervals:{},device:{id:d.deviceId,name:d.data.name,platform:d.data.platform,status:"ACTIVE",lastHeartbeatAt:Date.now(),timerState:"RUNNING",agentVersion:d.data.agentVersion}});
     return result;
   });
   app.post("/v1/device/idle",async request=>{
     const d=await requireDevice(request), body=eventInput.extend({idleId:id,endedAt:z.number().int().positive().nullable()}).parse(request.body);
     const ref=db.collection("idle_intervals").doc(body.idleId), sessionRef=db.collection("work_sessions").doc(body.sessionId);
-    await db.runTransaction(async tx=>{
+    const saved=await db.runTransaction(async tx=>{
       const [session,device,existing]=await Promise.all([tx.get(sessionRef),tx.get(d.ref),tx.get(ref)]);const s=session.data();
       if(device.data()?.status==="REVOKED")deviceFailure("DEVICE_REVOKED","This device has been revoked.");
       if(!s||s.deviceId!==d.deviceId)fail(404,"Session not found.");
       if(body.at<s.startedAt||(body.endedAt!==null&&(body.endedAt<body.at||body.endedAt>Date.now()+60000)))fail(400,"Invalid idle interval.");
       if(s.stoppedAt && (!body.endedAt||body.endedAt>s.stoppedAt))fail(409,"Idle interval is outside the session.");
       if(existing.exists&&existing.data()?.sessionId!==body.sessionId)fail(409,"Idle ID unavailable.");
-      if(existing.data()?.endedAt && body.endedAt===null)return;
+      // Device requests are queued and retried. Only the first transition for
+      // an interval changes the compact dashboard projection.
+      if(existing.data()?.endedAt)return false;
+      if(existing.exists&&body.endedAt===null)return false;
       tx.set(ref,{companyId:d.companyId,employeeId:d.employeeId,deviceId:d.deviceId,sessionId:body.sessionId,startedAt:body.at,endedAt:body.endedAt});
-    });return {saved:true};
+      return true;
+    });
+    if(saved)await patchDashboardEmployee(d.companyId,d.employeeId,{workStatus:body.endedAt===null?"IDLE":"WORKING",activeIdleStartedAt:body.endedAt===null?body.at:null,liveIdleIntervals:{[body.idleId]:{startedAt:body.at,endedAt:body.endedAt}}});
+    return {saved:true};
   });
   app.post("/v1/device/sessions/stop",async request=>{
     const d=await requireDevice(request), body=eventInput.parse(request.body), ref=db.collection("work_sessions").doc(body.sessionId);
