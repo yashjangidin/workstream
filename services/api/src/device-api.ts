@@ -27,6 +27,15 @@ export async function requireDevice(request: FastifyRequest) {
 }
 const eventInput=z.object({operationId:id,sessionId:id,at:z.number().int().positive().refine(v=>v<=Date.now()+60000,"Timestamp is in the future.")});
 export async function deviceRoutes(app:FastifyInstance) {
+  app.delete("/v1/device/self",async request=>{
+    const d=await requireDevice(request);
+    await db.runTransaction(async tx=>{
+      const employee=await tx.get(d.employeeRef);
+      if(employee.data()?.activeSessionId) fail(409,"Stop the timer before removing Workstream.");
+      tx.delete(d.ref);
+    });
+    return {removed:true};
+  });
   app.post("/v1/device/enroll",async request=>{
     const body=z.object({setupCode:z.string().min(8).max(100),installationId:id,credential:z.string().min(40).max(100),name:z.string().min(1).max(120),agentVersion:z.string().max(30)}).parse(request.body);
     const key=digest(body.setupCode.trim().toUpperCase()), lookup=db.collection("setup_codes").doc(key);

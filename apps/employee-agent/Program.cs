@@ -16,7 +16,8 @@ internal static class Deployment {
 }
 
 internal static class Program {
-    [STAThread] static void Main() { ApplicationConfiguration.Initialize(); using var mutex=new Mutex(true,"Local\\WorkstreamEmployeeAgent",out var first); if(!first)return; Application.Run(new AgentForm()); }
+    [STAThread] static void Main(string[] args) { if(args.Contains("--unregister")){Unregister();return;} ApplicationConfiguration.Initialize(); using var mutex=new Mutex(true,"Local\\WorkstreamEmployeeAgent",out var first); if(!first)return; Application.Run(new AgentForm()); }
+    static void Unregister(){try{using var store=new Store();var state=store.Load();if(string.IsNullOrWhiteSpace(state.DeviceId)||string.IsNullOrWhiteSpace(state.Credential))return;using var http=new HttpClient{Timeout=TimeSpan.FromSeconds(20)};using var request=new HttpRequestMessage(HttpMethod.Delete,state.ApiUrl+"/v1/device/self");request.Headers.Authorization=new AuthenticationHeaderValue("Device",state.DeviceId+"."+state.Credential);http.Send(request);}catch{ /* Local cleanup still proceeds when offline. */ }}
 }
 internal sealed class State {
     public string ApiUrl {get;set;}=Deployment.ApiUrl;

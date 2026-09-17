@@ -61,8 +61,9 @@ export async function employerRoutes(app:FastifyInstance) {
     await owned("employees",employeeId,a.companyId);
     const company=(await db.collection("companies").doc(a.companyId).get()).data()!,bounds=dayBounds(q.date,company.timezone);
     const collections=q.kind==="timeline"?["work_sessions","idle_intervals","activity_events","screenshots","alerts","devices"]:[{sessions:"work_sessions",idle:"idle_intervals",activity:"activity_events",screenshots:"screenshots",devices:"devices",alerts:"alerts"}[q.kind]];
-    const rows=(await Promise.all(collections.map(async c=>(await companyRecords(c,a.companyId)).filter(r=>r.employeeId===employeeId).map(r=>({...r,kind:c}))))).flat().filter(r=>{if(q.kind==="devices")return true;const t=milliseconds(r.startedAt??r.timestamp??r.createdAt);return t<bounds.end&&(!r.stoppedAt&&!r.endedAt&&r.status==="ACTIVE"||milliseconds(r.stoppedAt??r.endedAt??t)>=bounds.start);}).sort((a,b)=>milliseconds(b.startedAt??b.timestamp??b.createdAt)-milliseconds(a.startedAt??a.timestamp??a.createdAt));
-    return clean({records:rows.slice((q.page-1)*25,q.page*25),total:rows.length});
+    const rows=(await Promise.all(collections.map(async c=>(await companyRecords(c,a.companyId)).filter(r=>r.employeeId===employeeId).map(r=>({...r,kind:c}))))).flat().filter(r=>{if(q.kind==="devices")return r.status!=="REVOKED";const t=milliseconds(r.startedAt??r.timestamp??r.createdAt);return t<bounds.end&&(!r.stoppedAt&&!r.endedAt&&r.status==="ACTIVE"||milliseconds(r.stoppedAt??r.endedAt??t)>=bounds.start);}).sort((a,b)=>milliseconds(b.lastHeartbeatAt??b.startedAt??b.timestamp??b.createdAt)-milliseconds(a.lastHeartbeatAt??a.startedAt??a.timestamp??a.createdAt));
+    const visible=q.kind==="devices"?rows.slice(0,1):rows;
+    return clean({records:visible.slice((q.page-1)*25,q.page*25),total:visible.length});
   });
   app.get("/v1/screenshots/:id/image",async (request,reply)=>{
     const a=await requireEmployer(request),record=await owned("screenshots",id.parse((request.params as {id:string}).id),a.companyId);

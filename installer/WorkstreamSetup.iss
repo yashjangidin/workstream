@@ -24,6 +24,7 @@ Name: "{autoprograms}\Workstream"; Filename: "{app}\Workstream.exe"
 Filename: "{app}\Workstream.exe"; Description: "Launch Workstream"; Flags: nowait postinstall skipifsilent
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM Workstream.exe"; Flags: runhidden waituntilterminated
+Filename: "{app}\Workstream.exe"; Parameters: "--unregister"; Flags: runhidden waituntilterminated skipifdoesntexist
 [UninstallDelete]
 Type: filesandordirs; Name: "{localappdata}\Workstream"
 [Code]
