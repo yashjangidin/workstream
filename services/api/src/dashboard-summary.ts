@@ -7,7 +7,7 @@ import { operationalData } from "./operational-data.js";
 const refFor=(companyId:string)=>db.collection("dashboard_summaries").doc(companyId);
 
 function serialise(overview:any) {
-  return {summaryVersion:2,companyId:overview.company.id,company:overview.company,date:overview.date,
+  return {summaryVersion:1,companyId:overview.company.id,company:overview.company,date:overview.date,
     generatedAt:overview.generatedAt,employees:Object.fromEntries(overview.employees.map((employee:any)=>[employee.id,employee])),
     totals:overview.totals,alerts:overview.alerts};
 }
@@ -24,7 +24,7 @@ function deserialise(value:any) {
       const anchor=Math.max(generatedAt,Number(employee.activeSessionSnapshotAt)||Number(employee.activeSessionStartedAt));
       const extra=Math.max(0,Math.floor((now-anchor)/1000));
       const savedIntervals=Object.values(employee.liveIdleIntervals??{});
-      // A version-2 cache seeded during an already-open idle interval has no
+      // A compact cache seeded during an already-open idle interval has no
       // interval ID yet, so its explicit active-idle timestamp is the source.
       const liveIntervals=savedIntervals.length?savedIntervals:(employee.activeIdleStartedAt?[{startedAt:employee.activeIdleStartedAt,endedAt:null}]:[]);
       const liveIdleSeconds=liveIntervals.reduce((sum:number,rawInterval:any)=>{
@@ -51,7 +51,7 @@ function deserialise(value:any) {
  * refreshes read only this document. */
 export async function dashboardSummary(companyId:string,date?:string) {
   const ref=refFor(companyId),snapshot=await ref.get(),value=snapshot.data();
-  if(value?.summaryVersion===2&&value.company&&(!date||value.date===date)) return deserialise(value);
+  if(value?.summaryVersion===1&&value.company&&(!date||value.date===date)) return deserialise(value);
   const overview=await operationalData(companyId,date);
   await ref.set(serialise(overview));
   return overview;
@@ -68,7 +68,7 @@ export async function addDashboardTime(companyId:string,employeeId:string,totals
   const increment=(value:number)=>FieldValue.increment(value);
   await refFor(companyId).set({companyId,updatedAt:Date.now(),employees:{[employeeId]:{
     timerSeconds:increment(totals.timerSeconds),idleSeconds:increment(totals.idleSeconds),effectiveSeconds:increment(totals.effectiveSeconds),
-    timerStatus:"STOPPED",workStatus:"NOT_WORKING",activeSessionStartedAt:null,activeIdleStartedAt:null,liveIdleIntervals:FieldValue.delete()
+    timerStatus:"STOPPED",workStatus:"NOT_WORKING",activeSessionStartedAt:null,activeIdleStartedAt:null,liveIdleIntervals:null
   }},totals:{timerSeconds:increment(totals.timerSeconds),idleSeconds:increment(totals.idleSeconds),effectiveSeconds:increment(totals.effectiveSeconds)}},{merge:true});
 }
 
