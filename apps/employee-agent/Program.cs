@@ -63,7 +63,7 @@ internal sealed class Store : IDisposable {
     public void Dispose()=>connection.Dispose();
 }
 internal sealed class AgentForm:Form {
-    const string AgentVersion="0.2.8";
+    const string AgentVersion="0.2.9";
     const bool ScreenshotUploadsEnabled=false;
     readonly BrowserBridge bridge=new();
     readonly Button browserPair=new(){Text="Copy browser pairing key",Width=320},correction=new(){Text="Request time correction",Width=320};
@@ -173,6 +173,7 @@ internal sealed class AgentForm:Form {
             await Send("/v1/device/heartbeat",HttpMethod.Post,JsonSerializer.Serialize(new{agentVersion=AgentVersion,timerState=state.SessionId==null?"STOPPED":"RUNNING",timerStateAt=state.TimerStateChangedAt>0?state.TimerStateChangedAt:Now}));
             var conf=await Send("/v1/device/config",HttpMethod.Get);const string mode="SIMPLE_TIMER";
             if(mode!=state.MonitoringMode){activityAt=Now;lastCapture=Now;}state.MonitoringMode=mode;state.EmployeeName=conf.GetProperty("employeeName").GetString()!;state.IdleThresholdSeconds=conf.GetProperty("idleThresholdSeconds").GetInt32();state.RequiredDailySeconds=conf.GetProperty("requiredDailySeconds").GetInt32();state.HeartbeatSeconds=conf.GetProperty("heartbeatSeconds").GetInt32();state.Timezone=conf.GetProperty("timezone").GetString()!;state.LastAuthorizedAt=Now;authorization=AuthorizationStatus.Authorized;store.Save(state);
+            if(conf.TryGetProperty("notifications",out var notifications))foreach(var notification in notifications.EnumerateArray()){var id=notification.GetProperty("id").GetString();var title=notification.GetProperty("title").GetString()??"Workstream";var message=notification.GetProperty("message").GetString()??"";if(string.IsNullOrWhiteSpace(id)||string.IsNullOrWhiteSpace(message))continue;trayIcon.ShowBalloonTip(8000,title,message,ToolTipIcon.Info);try{await Send("/v1/device/notifications/"+id+"/acknowledge",HttpMethod.Post,"{}");}catch{/* Retry on the next successful sync. */}}
             var monitoringRetry=false;
             for(var count=0;count<50;count++){
                 var item=store.First();if(item==null)break;var body=item.Value.Body;

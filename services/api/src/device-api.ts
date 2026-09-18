@@ -53,7 +53,14 @@ export async function deviceRoutes(app:FastifyInstance) {
   });
   app.get("/v1/device/config",async request=>{
     const d=await requireDevice(request);
-    return {employeeName:d.employee.fullName,timezone:d.employee.timezone,requiredDailySeconds:d.employee.requiredDailySeconds,idleThresholdSeconds:d.employee.idleThresholdSeconds,monitoringMode:"SIMPLE_TIMER",heartbeatSeconds:config.HEARTBEAT_INTERVAL,screenshotSeconds:0};
+    const pending=(await db.collection("notification_jobs").where("employeeId","==",d.employeeId).get()).docs.map(doc=>({id:doc.id,...doc.data()} as {id:string;companyId:string;channel:string;status:string;createdAt:number;title:string;message:string})).filter(notification=>notification.companyId===d.companyId&&notification.channel==="WINDOWS_AGENT"&&notification.status==="PENDING").sort((a,b)=>Number(a.createdAt)-Number(b.createdAt)).slice(0,1).map(({id,title,message})=>({id,title,message}));
+    return {employeeName:d.employee.fullName,timezone:d.employee.timezone,requiredDailySeconds:d.employee.requiredDailySeconds,idleThresholdSeconds:d.employee.idleThresholdSeconds,monitoringMode:"SIMPLE_TIMER",heartbeatSeconds:config.HEARTBEAT_INTERVAL,screenshotSeconds:0,notifications:pending};
+  });
+  app.post("/v1/device/notifications/:id/acknowledge",async request=>{
+    const d=await requireDevice(request),notificationId=id.parse((request.params as {id:string}).id),ref=db.collection("notification_jobs").doc(notificationId),notification=(await ref.get()).data();
+    if(!notification||notification.channel!=="WINDOWS_AGENT"||notification.companyId!==d.companyId||notification.employeeId!==d.employeeId)fail(404,"Notification not found.");
+    if(notification.status==="PENDING")await ref.update({status:"DELIVERED",deliveredAt:Date.now(),deviceId:d.deviceId});
+    return {acknowledged:true};
   });
   app.post("/v1/device/heartbeat",async request=>{
     const d=await requireDevice(request);

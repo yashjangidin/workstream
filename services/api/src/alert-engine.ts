@@ -4,7 +4,7 @@ import { operationalData } from "./operational-data.js";
 import { milliseconds,dayBounds } from "@workstream/domain";
 import type { FastifyInstance } from "fastify";
 import { requireEmployer } from "./security.js";
-import { alertRule } from "./schemas.js";
+import { alertRule,employeeAlertTypes,employerEventAlertTypes } from "./schemas.js";
 import {notificationRecord,processNotifications} from './notifications.js';
 import {deliveryChannel} from './notification-channels.js';
 const minutesFor=(rule:unknown,fallback:number)=>{const value=rule as {trigger?:{minutes?:unknown};thresholdSeconds?:unknown}|undefined;const minutes=Number(value?.trigger?.minutes??(Number(value?.thresholdSeconds??fallback*60)/60));return Number.isFinite(minutes)&&minutes>0?minutes:fallback;};
@@ -16,31 +16,37 @@ const progressFor=(rule:unknown)=>{
 
 /** Every alert and delivery is explicitly opt-in. Disabled channels create no dashboard alert or job. */
 async function emit(companyId:string,employeeId:string,type:string,recipient:string,message:string,period:string,raw:unknown){
-  const rule=alertRule.safeParse(raw);if(!rule.success||!rule.data.enabled||rule.data.activationVersion!==2)return;
+  const employee=recipient==="EMPLOYEE",supported=employee?employeeAlertTypes:employerEventAlertTypes;
+  if(!supported.includes(type as never))return;
+  const rule=alertRule.safeParse(raw);if(!rule.success||!rule.data.enabled||rule.data.activationVersion!==3)return;
+  const permitted=employee?["WINDOWS_AGENT","EMAIL"]:["DASHBOARD","EMAIL","TELEGRAM"];
+  const requested=rule.data.channels.filter(channel=>permitted.includes(channel));
+  if(!requested.length)return;
   let destination=rule.data.recipient;
-  if(!destination&&rule.data.channels.some(channel=>channel!=="DASHBOARD")){
+  if(!destination&&requested.some(channel=>channel==="EMAIL")){
     if(recipient==="EMPLOYEE") destination=(await db.collection("employees").doc(employeeId).get()).data()?.email??"";
     else {
       const company=(await db.collection("companies").doc(companyId).get()).data();
       if(company?.ownerUserId){try{destination=(await auth.getUser(company.ownerUserId)).email??"";}catch{destination="";}}
     }
   }
-  const enabledChannels=(await Promise.all(rule.data.channels.map(async channel=>({channel,config:await deliveryChannel(companyId,channel)})))).filter(entry=>entry.config.enabled);
+  const enabledChannels=(await Promise.all(requested.map(async channel=>({channel,config:await deliveryChannel(companyId,channel)})))).filter(entry=>entry.config.enabled);
   if(!enabledChannels.length)return;
   const now=Date.now(),key=digest(companyId+":"+employeeId+":"+type+":"+recipient),window=db.collection("alert_cooldowns").doc(key),alert=db.collection("alerts").doc(digest(key+":"+period));
-  const records=await Promise.all(enabledChannels.filter(entry=>entry.channel!=="DASHBOARD").map(async entry=>({channel:entry.channel,record:await notificationRecord(companyId,{channel:entry.channel,recipient:destination,subject:'Workstream: '+type.replaceAll('_',' '),text:message})})));
+  const records=await Promise.all(enabledChannels.filter(entry=>entry.channel!=="DASHBOARD"&&entry.channel!=="WINDOWS_AGENT").map(async entry=>({channel:entry.channel,record:await notificationRecord(companyId,{channel:entry.channel,recipient:destination,subject:'Workstream: '+type.replaceAll('_',' '),text:message,audience:employee?'EMPLOYEE':'EMPLOYER'})})));
   await db.runTransaction(async tx=>{
     const [old,previous]=await Promise.all([tx.get(window),tx.get(alert)]);
     if(previous.exists||now-(old.data()?.lastSentAt??0)<cooldownFor(rule.data)*1000)return;
     tx.set(window,{companyId,lastSentAt:now});
     const deliveries=enabledChannels.map(({channel})=>{
       if(channel==='DASHBOARD')return {channel,status:'DELIVERED'};
+      if(channel==='WINDOWS_AGENT'){const ref=db.collection('notification_jobs').doc(digest(alert.id+':agent'));tx.create(ref,{companyId,employeeId,alertId:alert.id,channel,type,title:'Workstream reminder',message,status:'PENDING',attempts:0,nextAttemptAt:now,createdAt:now});return {channel,status:'PENDING',jobId:ref.id};}
       const ref=db.collection('notification_jobs').doc(digest(alert.id+':'+channel));
       const record=records.find(entry=>entry.channel===channel)!.record;
       if(!destination)record.status='NOT_CONFIGURED';
       tx.create(ref,{...record,alertId:alert.id,employeeId});return {channel,status:record.status,jobId:ref.id};
     });
-    tx.create(alert,{companyId,employeeId,type,recipient,message,channels:rule.data.channels,deliveryStatus:deliveries.every(d=>d.status==='DELIVERED')?'DELIVERED':'PARTIAL',deliveries,acknowledgedAt:null,createdAt:now});
+    tx.create(alert,{companyId,employeeId,type,recipient,message,channels:enabledChannels.map(entry=>entry.channel),deliveryStatus:deliveries.every(d=>d.status==='DELIVERED')?'DELIVERED':'PARTIAL',deliveries,acknowledgedAt:null,createdAt:now});
   });
 }
 export async function evaluateCompany(companyId:string){
@@ -71,7 +77,7 @@ export async function evaluateCompany(companyId:string){
       const parts=new Intl.DateTimeFormat("en-GB",{timeZone:overview.company.timezone,hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).format(now).split(":").map(Number);
       if(employee.officeStart&&employee.requiredSeconds>0&&employee.timerSeconds===0){
         const office=String(employee.officeStart).split(":").map(Number);
-        if(parts[0]*60+parts[1]>=office[0]*60+office[1]+Number(employee.lateStartDelaySeconds??3600)/60)await emit(companyId,employee.id,"LATE_START",recipient,employee.fullName+" has not started today's timer.",overview.date,rules.LATE_START);
+        if(parts[0]*60+parts[1]>=office[0]*60+office[1]+Number(employee.lateStartDelaySeconds??3600)/60)await emit(companyId,employee.id,"LATE_START",recipient,recipient==="EMPLOYEE"?"You haven't started today's Workstream timer.":employee.fullName+" hasn't started today's work timer.",overview.date,rules.LATE_START);
       }
       if(employee.officeEnd&&employee.remainingSeconds>0){
         const office=String(employee.officeEnd).split(":").map(Number);

@@ -2,7 +2,7 @@ import {z} from "zod";
 import {db} from "./firebase.js";
 import {encrypt,decrypt,encryptedNotificationsConfigured} from "./notifications.js";
 
-export const channelType=z.enum(["DASHBOARD","EMAIL","TELEGRAM","WHATSAPP"]);
+export const channelType=z.enum(["WINDOWS_AGENT","DASHBOARD","EMAIL","TELEGRAM","WHATSAPP"]);
 export type ChannelType=z.infer<typeof channelType>;
 const ref=(companyId:string,type:ChannelType)=>db.collection("notification_channels").doc(companyId+"_"+type);
 const mask=(value:string)=>value.length<5?"••••":"••••••••"+value.slice(-4);
@@ -13,12 +13,14 @@ export async function channelMetadata(companyId:string){
   const stored=new Map(docs.docs.map(doc=>[String(doc.data().type),doc.data()]));
   return channelType.options.map(type=>{
     const value=stored.get(type);
+    if(type==="WINDOWS_AGENT")return {type,enabled:true,status:"AVAILABLE",configured:true,maskedIdentifier:null,lastTestedAt:null,lastTestStatus:null};
     if(type==="DASHBOARD")return {type,enabled:Boolean(value?.enabled),status:"AVAILABLE",configured:true,maskedIdentifier:null,lastTestedAt:value?.lastTestedAt??null,lastTestStatus:value?.lastTestStatus??null};
     return {type,enabled:Boolean(value?.enabled),status:value?.status??"NOT_CONFIGURED",configured:Boolean(value?.encryptedCredentials||value?.providerConfigured),maskedIdentifier:value?.maskedIdentifier??null,lastTestedAt:value?.lastTestedAt??null,lastTestStatus:value?.lastTestStatus??null};
   });
 }
 
 export async function saveChannel(companyId:string,type:ChannelType,input:{enabled:boolean;destination?:string;token?:string;provider?:string}){
+  if(type==="WINDOWS_AGENT")throw Object.assign(new Error("The Windows agent channel is available automatically on enrolled devices."),{statusCode:400});
   if(type!=="DASHBOARD"&&!encryptedNotificationsConfigured())throw Object.assign(new Error("Notification encryption is not configured on the server."),{statusCode:503});
   const current=(await ref(companyId,type).get()).data();
   let encryptedCredentials=current?.encryptedCredentials??null,maskedIdentifier=current?.maskedIdentifier??null,providerConfigured=Boolean(current?.providerConfigured);
@@ -32,6 +34,7 @@ export async function removeChannel(companyId:string,type:ChannelType){if(type==
 
 /** Server-only delivery lookup. Never return this value from a route. */
 export async function deliveryChannel(companyId:string,type:ChannelType){
+  if(type==="WINDOWS_AGENT")return {enabled:true,configured:true,destination:"",credentials:null as Record<string,string>|null};
   const value=(await ref(companyId,type).get()).data();
   if(type==="DASHBOARD")return {enabled:Boolean(value?.enabled),configured:true,destination:"",credentials:null as Record<string,string>|null};
   if(!value?.enabled)return {enabled:false,configured:false,destination:"",credentials:null as Record<string,string>|null};

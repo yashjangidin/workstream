@@ -3,7 +3,7 @@ import {db} from './firebase.js';
 import type {DocumentReference} from 'firebase-admin/firestore';
 import {deliveryChannel} from './notification-channels.js';
 
-export type Channel='DASHBOARD'|'EMAIL'|'TELEGRAM'|'WHATSAPP';
+export type Channel='WINDOWS_AGENT'|'DASHBOARD'|'EMAIL'|'TELEGRAM'|'WHATSAPP';
 export function channelConfigured(channel:Channel){
   if(channel==='DASHBOARD')return true;
   if(channel==='EMAIL')return !!(process.env.RESEND_API_KEY&&process.env.EMAIL_FROM);
@@ -14,7 +14,7 @@ function encryptionKey(){const raw=process.env.NOTIFICATION_ENCRYPTION_KEY;const
 export const encryptedNotificationsConfigured=()=>!!encryptionKey();
 export function encrypt(value:string){const key=encryptionKey();if(!key)return null;const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',key,iv);return Buffer.concat([iv,cipher.update(value,'utf8'),cipher.final(),cipher.getAuthTag()]).toString('base64');}
 export function decrypt(value:string){const key=encryptionKey();if(!key)throw new Error('Notification encryption key is not configured.');const raw=Buffer.from(value,'base64'),decipher=createDecipheriv('aes-256-gcm',key,raw.subarray(0,12));decipher.setAuthTag(raw.subarray(-16));return Buffer.concat([decipher.update(raw.subarray(12,-16)),decipher.final()]).toString('utf8');}
-export type Message={channel:Channel;recipient:string;subject:string;text:string};
+export type Message={channel:Channel;recipient:string;subject:string;text:string;audience?:'EMPLOYEE'|'EMPLOYER'};
 export interface Provider {send(message:Message,key:string):Promise<string>}
 export const providers:Partial<Record<Channel,Provider>>={
   EMAIL:{async send(message,key){
@@ -42,13 +42,13 @@ export async function deliver(ref:DocumentReference){
       const token=config.credentials?.token;if(!token)throw new Error('Telegram is not configured');
       const response=await fetch('https://api.telegram.org/bot'+token+'/sendMessage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:config.destination||message.recipient,text:message.text.slice(0,4096)}),signal:AbortSignal.timeout(15000)});
       const reply=await response.json() as {ok:boolean;result?:{message_id:number}};if(!response.ok||!reply.ok)throw new Error('Telegram provider rejected delivery');result={status:'DELIVERED',providerId:String(reply.result!.message_id),deliveredAt:Date.now()};
-    }else {const provider=providers[message.channel];if(!provider)throw new Error('Channel adapter unavailable');const providerId=await provider.send({...message,recipient:config.destination||message.recipient},ref.id);result={status:'DELIVERED',providerId,deliveredAt:Date.now()};}}
+    }else {const provider=providers[message.channel];if(!provider)throw new Error('Channel adapter unavailable');const recipient=message.audience==='EMPLOYEE'?message.recipient:(config.destination||message.recipient);const providerId=await provider.send({...message,recipient},ref.id);result={status:'DELIVERED',providerId,deliveredAt:Date.now()};}}
   catch{const attempts=Number(job.attempts??0)+1;result={status:job.channel==='TELEGRAM'?'REVIEW_REQUIRED':attempts>=5?'FAILED':'RETRY',attempts,nextAttemptAt:Date.now()+Math.min(3600000,30000*2**attempts),lastError:'Provider delivery failed. Credentials, destination or network require attention.'};}
   await db.runTransaction(async tx=>{if((await tx.get(ref)).data()?.lease===lease)tx.update(ref,{...result,leaseUntil:0});});
 }
 export async function processNotifications(companyId:string){
   for(const collection of ['notification_jobs','invitations']){
     const docs=await db.collection(collection).where('companyId','==',companyId).get();
-    for(const doc of docs.docs)await deliver(doc.ref);
+    for(const doc of docs.docs)if(doc.data().channel!=='WINDOWS_AGENT')await deliver(doc.ref);
   }
 }
