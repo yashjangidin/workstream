@@ -6,6 +6,8 @@ import {operationalData} from './operational-data.js';
 import {evaluateCompany} from './alert-engine.js';
 import {notificationRecord,processNotifications} from './notifications.js';
 import {timingSafeEqual} from 'node:crypto';
+import {alertRule} from './schemas.js';
+import {deliveryChannel} from './notification-channels.js';
 
 export async function scheduledReports(companyId:string){
   const company=(await db.collection('companies').doc(companyId).get()).data()!;
@@ -18,7 +20,9 @@ export async function scheduledReports(companyId:string){
     const count=period==='WEEKLY_REPORT'?7:1,from=nextDate(today,-count);
     const days: Awaited<ReturnType<typeof operationalData>>[]=[];for(let i=0;i<count;i++)days.push(await operationalData(companyId,nextDate(from,i)));
     for(const recipient of ['employerAlerts','employeeAlerts']){
-      const rule=settings.docs.find(d=>d.id===recipient)?.data()?.[period];if(!rule?.enabled)continue;
+      const parsed=alertRule.safeParse(settings.docs.find(d=>d.id===recipient)?.data()?.[period]);
+      if(!parsed.success||!parsed.data.enabled||parsed.data.activationVersion!==2)continue;
+      const rule=parsed.data;
       const trigger=rule.trigger??{}, [hour,minute]=String(trigger.time??(period==='DAILY_REPORT'?'18:00':'09:00')).split(':').map(Number);
       if(Number.isFinite(hour)&&Number.isFinite(minute)&&minutesNow<hour*60+minute)continue;
       if(period==='WEEKLY_REPORT'&&trigger.day&&String(trigger.day)!==localParts.weekday)continue;
@@ -30,11 +34,14 @@ export async function scheduledReports(companyId:string){
         const totals=rows.reduce((s,e)=>({timer:s.timer+e.timerSeconds,idle:s.idle+e.idleSeconds,effective:s.effective+e.effectiveSeconds,required:s.required+e.requiredSeconds}),{timer:0,idle:0,effective:0,required:0});
         const key=digest(companyId+':'+period+':'+recipient+':'+audience+':'+from),ref=db.collection('report_runs').doc(key);
         const message=`${period==='DAILY_REPORT'?'Daily':'Weekly'} Workstream report ${from} to ${yesterday}. Timer: ${totals.timer}s. Idle: ${totals.idle}s. Effective: ${totals.effective}s. Required: ${totals.required}s.`;
+        const activeChannels=(await Promise.all(rule.channels.map(async channel=>({channel,config:await deliveryChannel(companyId,channel)})))).filter(entry=>entry.config.enabled);
+        if(!activeChannels.length)continue;
+        const destination=recipient==='employeeAlerts'?(days[0].employees.find(e=>e.id===audience)?.email??''):employerDestination;
+        const records=await Promise.all(activeChannels.filter(entry=>entry.channel!=='DASHBOARD').map(async entry=>({channel:entry.channel,record:await notificationRecord(companyId,{channel:entry.channel,recipient:destination,subject:'Workstream '+period.replaceAll('_',' '),text:message})})));
         await db.runTransaction(async tx=>{if((await tx.get(ref)).exists)return;
           tx.create(ref,{companyId,period,from,to:yesterday,audience,totals,status:'GENERATED',createdAt:Date.now()});
-          for(const channel of rule.channels){if(channel==='DASHBOARD'){tx.create(db.collection('alerts').doc(digest(key+':dashboard')),{companyId,employeeId:audience==='company'?null:audience,type:period,message,recipient,deliveryStatus:'DELIVERED',channels:['DASHBOARD'],acknowledgedAt:null,createdAt:Date.now()});continue;}
-            const destination=recipient==='employeeAlerts'?(days[0].employees.find(e=>e.id===audience)?.email??''):employerDestination;
-            const record=notificationRecord(companyId,{channel,recipient:destination,subject:'Workstream '+period.replaceAll('_',' '),text:message});if(!destination)record.status='NOT_CONFIGURED';tx.create(db.collection('notification_jobs').doc(digest(key+':'+channel)),record);
+          for(const {channel} of activeChannels){if(channel==='DASHBOARD'){tx.create(db.collection('alerts').doc(digest(key+':dashboard')),{companyId,employeeId:audience==='company'?null:audience,type:period,message,recipient,deliveryStatus:'DELIVERED',channels:['DASHBOARD'],acknowledgedAt:null,createdAt:Date.now()});continue;}
+            const record=records.find(entry=>entry.channel===channel)!.record;if(!destination)record.status='NOT_CONFIGURED';tx.create(db.collection('notification_jobs').doc(digest(key+':'+channel)),record);
           }
         });
       }

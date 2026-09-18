@@ -6,6 +6,7 @@ import type { FastifyInstance } from "fastify";
 import { requireEmployer } from "./security.js";
 import { alertRule } from "./schemas.js";
 import {notificationRecord,processNotifications} from './notifications.js';
+import {deliveryChannel} from './notification-channels.js';
 const minutesFor=(rule:unknown,fallback:number)=>{const value=rule as {trigger?:{minutes?:unknown};thresholdSeconds?:unknown}|undefined;const minutes=Number(value?.trigger?.minutes??(Number(value?.thresholdSeconds??fallback*60)/60));return Number.isFinite(minutes)&&minutes>0?minutes:fallback;};
 const cooldownFor=(rule:unknown,fallback=30)=>{const seconds=Number((rule as {cooldownSeconds?:unknown}|undefined)?.cooldownSeconds??fallback*60);return Number.isFinite(seconds)&&seconds>=60?seconds: fallback*60;};
 const progressFor=(rule:unknown)=>{
@@ -13,9 +14,9 @@ const progressFor=(rule:unknown)=>{
   return Number.isFinite(percent)?Math.min(100,Math.max(1,percent)):75;
 };
 
-/** Dashboard delivery is part of the atomic alert write. External channels report unconfigured. */
+/** Every alert and delivery is explicitly opt-in. Disabled channels create no dashboard alert or job. */
 async function emit(companyId:string,employeeId:string,type:string,recipient:string,message:string,period:string,raw:unknown){
-  const rule=alertRule.safeParse(raw);if(!rule.success||!rule.data.enabled)return;
+  const rule=alertRule.safeParse(raw);if(!rule.success||!rule.data.enabled||rule.data.activationVersion!==2)return;
   let destination=rule.data.recipient;
   if(!destination&&rule.data.channels.some(channel=>channel!=="DASHBOARD")){
     if(recipient==="EMPLOYEE") destination=(await db.collection("employees").doc(employeeId).get()).data()?.email??"";
@@ -24,15 +25,18 @@ async function emit(companyId:string,employeeId:string,type:string,recipient:str
       if(company?.ownerUserId){try{destination=(await auth.getUser(company.ownerUserId)).email??"";}catch{destination="";}}
     }
   }
+  const enabledChannels=(await Promise.all(rule.data.channels.map(async channel=>({channel,config:await deliveryChannel(companyId,channel)})))).filter(entry=>entry.config.enabled);
+  if(!enabledChannels.length)return;
   const now=Date.now(),key=digest(companyId+":"+employeeId+":"+type+":"+recipient),window=db.collection("alert_cooldowns").doc(key),alert=db.collection("alerts").doc(digest(key+":"+period));
+  const records=await Promise.all(enabledChannels.filter(entry=>entry.channel!=="DASHBOARD").map(async entry=>({channel:entry.channel,record:await notificationRecord(companyId,{channel:entry.channel,recipient:destination,subject:'Workstream: '+type.replaceAll('_',' '),text:message})})));
   await db.runTransaction(async tx=>{
     const [old,previous]=await Promise.all([tx.get(window),tx.get(alert)]);
     if(previous.exists||now-(old.data()?.lastSentAt??0)<cooldownFor(rule.data)*1000)return;
     tx.set(window,{companyId,lastSentAt:now});
-    const deliveries=rule.data.channels.map(channel=>{
+    const deliveries=enabledChannels.map(({channel})=>{
       if(channel==='DASHBOARD')return {channel,status:'DELIVERED'};
       const ref=db.collection('notification_jobs').doc(digest(alert.id+':'+channel));
-      const record=notificationRecord(companyId,{channel,recipient:destination,subject:'Workstream: '+type.replaceAll('_',' '),text:message});
+      const record=records.find(entry=>entry.channel===channel)!.record;
       if(!destination)record.status='NOT_CONFIGURED';
       tx.create(ref,{...record,alertId:alert.id,employeeId});return {channel,status:record.status,jobId:ref.id};
     });

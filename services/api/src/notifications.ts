@@ -1,6 +1,7 @@
 import {createCipheriv,createDecipheriv,randomBytes} from 'node:crypto';
 import {db} from './firebase.js';
 import type {DocumentReference} from 'firebase-admin/firestore';
+import {deliveryChannel} from './notification-channels.js';
 
 export type Channel='DASHBOARD'|'EMAIL'|'TELEGRAM'|'WHATSAPP';
 export function channelConfigured(channel:Channel){
@@ -21,25 +22,27 @@ export const providers:Partial<Record<Channel,Provider>>={
     if(!response.ok)throw new Error('Email provider returned '+response.status);
     return (await response.json() as {id:string}).id;
   }},
-  TELEGRAM:{async send(message){
-    const response=await fetch('https://api.telegram.org/bot'+process.env.TELEGRAM_BOT_TOKEN+'/sendMessage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:message.recipient,text:message.text.slice(0,4096)}),signal:AbortSignal.timeout(15000)});
-    const result=await response.json() as {ok:boolean;result?:{message_id:number}};
-    if(!response.ok||!result.ok)throw new Error('Telegram provider rejected delivery');
-    return String(result.result!.message_id);
-  }}
 };
-export function notificationRecord(companyId:string,message:Message){
+export async function notificationRecord(companyId:string,message:Message,systemDelivery=false){
+  const config=systemDelivery?{enabled:true,configured:channelConfigured(message.channel)}:await deliveryChannel(companyId,message.channel);
   const encryptedBody=encrypt(JSON.stringify(message));
-  return {companyId,channel:message.channel,encryptedBody,status:channelConfigured(message.channel)&&encryptedBody?'PENDING':'NOT_CONFIGURED',attempts:0,nextAttemptAt:Date.now(),createdAt:Date.now()};
+  return {companyId,channel:message.channel,encryptedBody,status:config.enabled&&config.configured&&encryptedBody?'PENDING':'NOT_CONFIGURED',systemDelivery,attempts:0,nextAttemptAt:Date.now(),createdAt:Date.now()};
 }
 /** A transactional lease prevents concurrent workers. Email provider retries share a stable key.
  * Telegram offers no idempotency key: ambiguous network failures are retained for manual review. */
 export async function deliver(ref:DocumentReference){
   const lease=randomBytes(16).toString('hex');
-  const job=await db.runTransaction(async tx=>{const data=(await tx.get(ref)).data();if(!data||['DELIVERED','FAILED','REVIEW_REQUIRED'].includes(data.status)||data.nextAttemptAt>Date.now()||data.leaseUntil>Date.now())return null;if(!data.encryptedBody||!channelConfigured(data.channel)||!encryptionKey()){tx.update(ref,{status:'NOT_CONFIGURED'});return null;}tx.update(ref,{status:'SENDING',lease,leaseUntil:Date.now()+60000});return data;});
+  const before=(await ref.get()).data();if(!before)return;
+  const config=before.systemDelivery?{enabled:true,configured:channelConfigured(before.channel as Channel),destination:"",credentials:null}:await deliveryChannel(String(before.companyId),before.channel as Channel);
+  const job=await db.runTransaction(async tx=>{const data=(await tx.get(ref)).data();if(!data||['DELIVERED','FAILED','REVIEW_REQUIRED','NOT_CONFIGURED'].includes(data.status)||data.nextAttemptAt>Date.now()||data.leaseUntil>Date.now())return null;if(!data.encryptedBody||!config.enabled||!config.configured||!encryptionKey()){tx.update(ref,{status:'NOT_CONFIGURED'});return null;}tx.update(ref,{status:'SENDING',lease,leaseUntil:Date.now()+60000});return data;});
   if(!job)return;
   let result:Record<string,unknown>;
-  try{const message=JSON.parse(decrypt(job.encryptedBody)) as Message;const provider=providers[message.channel];if(!provider)throw new Error('Channel adapter unavailable');const providerId=await provider.send(message,ref.id);result={status:'DELIVERED',providerId,deliveredAt:Date.now()};}
+  try{const message=JSON.parse(decrypt(job.encryptedBody)) as Message;
+    if(message.channel==='TELEGRAM'){
+      const token=config.credentials?.token;if(!token)throw new Error('Telegram is not configured');
+      const response=await fetch('https://api.telegram.org/bot'+token+'/sendMessage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:config.destination||message.recipient,text:message.text.slice(0,4096)}),signal:AbortSignal.timeout(15000)});
+      const reply=await response.json() as {ok:boolean;result?:{message_id:number}};if(!response.ok||!reply.ok)throw new Error('Telegram provider rejected delivery');result={status:'DELIVERED',providerId:String(reply.result!.message_id),deliveredAt:Date.now()};
+    }else {const provider=providers[message.channel];if(!provider)throw new Error('Channel adapter unavailable');const providerId=await provider.send({...message,recipient:config.destination||message.recipient},ref.id);result={status:'DELIVERED',providerId,deliveredAt:Date.now()};}}
   catch{const attempts=Number(job.attempts??0)+1;result={status:job.channel==='TELEGRAM'?'REVIEW_REQUIRED':attempts>=5?'FAILED':'RETRY',attempts,nextAttemptAt:Date.now()+Math.min(3600000,30000*2**attempts),lastError:'Provider delivery failed. Credentials, destination or network require attention.'};}
   await db.runTransaction(async tx=>{if((await tx.get(ref)).data()?.lease===lease)tx.update(ref,{...result,leaseUntil:0});});
 }

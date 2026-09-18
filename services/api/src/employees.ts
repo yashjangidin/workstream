@@ -50,7 +50,7 @@ export async function employeeRoutes(app: FastifyInstance) {
   });
   app.post("/v1/employees",async (request,reply)=>{
     const actor=await requireEmployer(request),value=employeeInput.parse(request.body),employee=db.collection("employees").doc(),code=newCode(),key=digest(code);
-    const invitation=db.collection("invitations").doc(),delivery=notificationRecord(actor.companyId,{channel:"EMAIL",recipient:value.email,subject:"Your Workstream invitation",text:inviteText(value.fullName,code)});
+    const invitation=db.collection("invitations").doc(),delivery=await notificationRecord(actor.companyId,{channel:"EMAIL",recipient:value.email,subject:"Your Workstream invitation",text:inviteText(value.fullName,code)},true);
     await db.runTransaction(async tx=>{
       const claim=db.collection("email_claims").doc(value.email),lookup=db.collection("setup_codes").doc(key);
       const [email,collision]=await Promise.all([tx.get(claim),tx.get(lookup)]);
@@ -94,7 +94,7 @@ export async function employeeRoutes(app: FastifyInstance) {
     const employee=await owned("employees",employeeId,actor.companyId);
     if(!employee.data.setupCodeEncrypted) return reply.code(503).send({message:"Configure notification encryption and regenerate the setup code before emailing an invitation."});
     const code=decrypt(employee.data.setupCodeEncrypted),ref=db.collection("invitations").doc();
-    await ref.create({...notificationRecord(actor.companyId,{channel:"EMAIL",recipient:employee.data.email,subject:"Your Workstream invitation",text:inviteText(employee.data.fullName,code)}),employeeId});
+    await ref.create({...await notificationRecord(actor.companyId,{channel:"EMAIL",recipient:employee.data.email,subject:"Your Workstream invitation",text:inviteText(employee.data.fullName,code)},true),employeeId});
     await deliver(ref);return {invitationStatus:(await ref.get()).data()?.status};
   });
   app.delete("/v1/employees/:employeeId",async (request,reply)=>{

@@ -2,22 +2,30 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db, storage } from "./firebase.js";
 import { requireEmployer } from "./security.js";
-import { id, dateInput, schedule, timezone, ruleInput, alertSettings, defaultEmployerAlerts, defaultEmployeeAlerts } from "./schemas.js";
+import { id, dateInput, schedule, timezone, ruleInput, alertSettings, defaultEmployerAlerts, defaultEmployeeAlerts, normaliseAlerts } from "./schemas.js";
 import { owned, clean, companyRecords, fail } from "./repository.js";
 import { operationalData } from "./operational-data.js";
 import { dayBounds, nextDate, localDate, milliseconds } from "@workstream/domain";
 
 import {channelConfigured,encryptedNotificationsConfigured} from "./notifications.js";
+import {channelMetadata,channelType,removeChannel,saveChannel,testTelegram} from "./notification-channels.js";
 const defaults={timezone:"UTC",requiredDailySeconds:28800,workdays:[1,2,3,4,5],idleThresholdSeconds:30,monitoringMode:"SIMPLE_TIMER",lateStartDelaySeconds:3600};
 export async function employerRoutes(app:FastifyInstance) {
   app.get("/v1/settings",async request=>{
     const a=await requireEmployer(request),company=await db.collection("companies").doc(a.companyId).get();
     const settings=await company.ref.collection("settings").get();
-    return clean({company:{name:company.data()?.name,timezone:company.data()?.timezone},defaults:{...defaults,...settings.docs.find(d=>d.id==="defaults")?.data()},employerAlerts:{...defaultEmployerAlerts,...settings.docs.find(d=>d.id==="employerAlerts")?.data()},employeeAlerts:{...defaultEmployeeAlerts,...settings.docs.find(d=>d.id==="employeeAlerts")?.data()},channels:{DASHBOARD:{configured:true},EMAIL:{configured:channelConfigured("EMAIL")&&encryptedNotificationsConfigured()},TELEGRAM:{configured:channelConfigured("TELEGRAM")&&encryptedNotificationsConfigured()},WHATSAPP:{configured:false}}});
+    return clean({company:{name:company.data()?.name,timezone:company.data()?.timezone},defaults:{...defaults,...settings.docs.find(d=>d.id==="defaults")?.data()},employerAlerts:normaliseAlerts(settings.docs.find(d=>d.id==="employerAlerts")?.data(),defaultEmployerAlerts),employeeAlerts:normaliseAlerts(settings.docs.find(d=>d.id==="employeeAlerts")?.data(),defaultEmployeeAlerts),channels:await channelMetadata(a.companyId)});
   });
+  app.get("/v1/notification-channels",async request=>clean(await channelMetadata((await requireEmployer(request)).companyId)));
+  app.put("/v1/notification-channels/:type",async request=>{
+    const a=await requireEmployer(request),type=channelType.parse((request.params as {type:string}).type),body=z.object({enabled:z.boolean(),destination:z.string().max(254).optional(),token:z.string().min(8).max(512).optional(),provider:z.string().max(80).optional()}).parse(request.body);
+    await saveChannel(a.companyId,type,body);await db.collection("audit_logs").add({companyId:a.companyId,actorUserId:a.uid,action:"NOTIFICATION_CHANNEL_SAVED",targetId:type,createdAt:Date.now()});return clean((await channelMetadata(a.companyId)).find(channel=>channel.type===type));
+  });
+  app.delete("/v1/notification-channels/:type",async request=>{const a=await requireEmployer(request),type=channelType.parse((request.params as {type:string}).type);await removeChannel(a.companyId,type);await db.collection("audit_logs").add({companyId:a.companyId,actorUserId:a.uid,action:"NOTIFICATION_CHANNEL_REMOVED",targetId:type,createdAt:Date.now()});return {removed:true};});
+  app.post("/v1/notification-channels/TELEGRAM/test",async request=>{const a=await requireEmployer(request),body=z.object({token:z.string().min(8).max(512).optional(),chatId:z.string().min(1).max(128).optional()}).parse(request.body);return testTelegram(a.companyId,body);});
   app.patch("/v1/settings/:section",async request=>{
     const a=await requireEmployer(request),section=z.enum(["company","defaults","employerAlerts","employeeAlerts"]).parse((request.params as {section:string}).section);
-    const value=section==="company"?z.object({name:z.string().trim().min(2).max(120),timezone}).parse(request.body):section==="defaults"?schedule.parse(request.body):alertSettings.parse(request.body);
+    const value=section==="company"?z.object({name:z.string().trim().min(2).max(120),timezone}).parse(request.body):section==="defaults"?schedule.parse(request.body):Object.fromEntries(Object.entries(alertSettings.parse(request.body)).map(([type,rule])=>[type,{...rule,activationVersion:2}]));
     const company=db.collection("companies").doc(a.companyId),ref=section==="company"?company:company.collection("settings").doc(section);
     await db.runTransaction(async tx=>{const before=await tx.get(ref);const employees=section==="defaults"?await tx.get(db.collection("employees").where("companyId","==",a.companyId).where("status","==","ACTIVE")):null;tx.set(ref,value,{merge:section==="company"});if(employees){const shared=value as {workdays:number[];idleThresholdSeconds:number;officeStart?:string;officeEnd?:string;lateStartDelaySeconds:number};for(const employee of employees.docs)tx.update(employee.ref,{workdays:shared.workdays,idleThresholdSeconds:shared.idleThresholdSeconds,officeStart:shared.officeStart??null,officeEnd:shared.officeEnd??null,lateStartDelaySeconds:shared.lateStartDelaySeconds,updatedAt:Date.now()});}tx.create(db.collection("audit_logs").doc(),{companyId:a.companyId,actorUserId:a.uid,action:"SETTINGS_UPDATED",targetId:section,oldValue:clean(before.data()),newValue:value,createdAt:Date.now()});});
     return {saved:true};
