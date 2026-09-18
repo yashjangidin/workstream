@@ -1,0 +1,39 @@
+name: Workstream alert scheduler
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workstream-alert-scheduler
+  cancel-in-progress: false
+
+jobs:
+  evaluate-alerts-and-reports:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Run Workstream scheduled jobs
+        env:
+          SCHEDULER_SECRET: ${{ secrets.SCHEDULER_SECRET }}
+        run: |
+          if [ -z "$SCHEDULER_SECRET" ]; then
+            echo "::error::The SCHEDULER_SECRET repository secret is not configured."
+            exit 1
+          fi
+
+          curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --retry 3 \
+            --retry-delay 10 \
+            --retry-all-errors \
+            --max-time 240 \
+            --request POST \
+            --header "Authorization: Bearer ${SCHEDULER_SECRET}" \
+            "https://workstream-api-tlk3.onrender.com/v1/jobs/run"
