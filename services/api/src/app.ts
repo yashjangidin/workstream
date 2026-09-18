@@ -23,7 +23,7 @@ app.addHook("onRequest",async (request,reply)=>{
 const localOrigins = ["http://localhost:5173", "http://127.0.0.1:5173"];
 await app.register(cors, {
   origin: config.NODE_ENV === "development" ? localOrigins : config.APP_BASE_URL,
-  methods: ["GET", "POST", "PATCH", "DELETE"]
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE"]
 });
 app.get("/", async () => ({ service: "Workstream API", status: "ok", health: "/healthz" }));
 app.get("/healthz", async () => ({ status: "ok" }));

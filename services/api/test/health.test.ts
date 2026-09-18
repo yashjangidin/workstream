@@ -13,3 +13,19 @@ test("base API endpoint and health check provide a usable service response", asy
   assert.deepEqual(health.json(), { status: "ok" });
   await app.close();
 });
+
+test("browser preflight permits notification channel updates", async () => {
+  const app = await buildApp();
+  const response = await app.inject({
+    method: "OPTIONS",
+    url: "/v1/notification-channels/DASHBOARD",
+    headers: {
+      origin: "http://localhost:5173",
+      "access-control-request-method": "PUT",
+      "access-control-request-headers": "authorization,content-type"
+    }
+  });
+  assert.equal(response.statusCode, 204);
+  assert.match(response.headers["access-control-allow-methods"] ?? "", /\bPUT\b/);
+  await app.close();
+});
