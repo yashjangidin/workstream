@@ -17,6 +17,8 @@ try{
     using(var reopened=new Store(path)){
         Check(reopened.Load().SessionId=="recovery-session","session survives SQLite connection restart");
         Check(reopened.Load().Credential==credential,"DPAPI decrypts the persisted device credential");
+        reopened.AddLog(1000,"Timer started","");reopened.AddLog(2000,"Timer auto-stopped","After 30 minutes idle");
+        Check(reopened.RecentLogs().Contains("Timer auto-stopped")&&reopened.RecentLogs().Contains("After 30 minutes idle"),"recent timer activity is retained for the agent widget");
         var item=reopened.First()!.Value;Check(item.Path.EndsWith("/start"),"start syncs before later events");reopened.Complete(item.Id,null);
         item=reopened.First()!.Value;Check(item.Path.EndsWith("/stop"),"timer stop bypasses pending screenshots");reopened.Complete(item.Id,null);
         item=reopened.First()!.Value;reopened.Quarantine(item.Id,"test rejection");Check(reopened.First()==null,"rejected monitoring event cannot block the outbox");
@@ -31,6 +33,7 @@ try{
         var cleared=reopened.Load();
         Check(cleared.DeviceId==""&&cleared.Credential==""&&cleared.EmployeeName==""&&cleared.SessionId==null,"revocation clears cached identity, credential, and timer state");
         Check(reopened.First()==null,"revocation removes old employee outbox data before re-enrollment");
+        Check(reopened.RecentLogs()=="No timer activity yet.","re-enrollment cannot expose the previous employee's timer log");
         Check(!File.Exists(oldCapture),"revocation removes pending old employee screenshot files");
     }
     Check(!AuthorizationGate.CanOperate(AuthorizationStatus.SetupRequired,"device",1000,1000),"setup-required state cannot operate");

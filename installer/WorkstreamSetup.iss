@@ -1,6 +1,6 @@
 #define MyAppName "Workstream"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.10"
+  #define MyAppVersion "0.2.11"
 #endif
 #define MyAppPublisher "Workstream"
 #ifndef AgentPublishDir

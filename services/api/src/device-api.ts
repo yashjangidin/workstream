@@ -53,38 +53,45 @@ export async function deviceRoutes(app:FastifyInstance) {
   });
   app.get("/v1/device/config",async request=>{
     const d=await requireDevice(request);
-    return {employeeName:d.employee.fullName,timezone:d.employee.timezone,requiredDailySeconds:d.employee.requiredDailySeconds,idleThresholdSeconds:d.employee.idleThresholdSeconds,monitoringMode:"SIMPLE_TIMER",heartbeatSeconds:config.HEARTBEAT_INTERVAL,screenshotSeconds:0};
+    return {employeeName:d.employee.fullName,timezone:d.employee.timezone,requiredDailySeconds:d.employee.requiredDailySeconds,idleThresholdSeconds:d.employee.idleThresholdSeconds,autoStopIdleSeconds:d.employee.autoStopIdleSeconds??1800,monitoringMode:"SIMPLE_TIMER",heartbeatSeconds:config.HEARTBEAT_INTERVAL,screenshotSeconds:0};
   });
   app.post("/v1/device/heartbeat",async request=>{
     const d=await requireDevice(request);
-    const body=z.object({agentVersion:z.string().max(30),timerState:z.enum(["RUNNING","STOPPED"]),sessionId:id.nullable().optional(),timerStateAt:z.number().int().positive().refine(v=>v<=Date.now()+60000,"Timestamp is in the future.").optional()}).parse(request.body);
-    const stopped=await db.runTransaction(async tx=>{
+    const body=z.object({agentVersion:z.string().max(30),timerState:z.enum(["RUNNING","STOPPED"]),sessionId:id.nullable().optional(),timerStateAt:z.number().int().positive().refine(v=>v<=Date.now()+60000,"Timestamp is in the future.").optional(),stopReason:z.enum(["MANUAL","INACTIVITY"]).nullable().optional()}).parse(request.body);
+    const reconciliation=await db.runTransaction(async tx=>{
       const [doc,employee]=await Promise.all([tx.get(d.ref),tx.get(d.employeeRef)]);
       if(doc.data()?.status==="REVOKED")deviceFailure("DEVICE_REVOKED","This device has been revoked.");
       const now=Date.now();
       const activeSessionId=employee.data()?.activeSessionId;
       let sessionRef:any, session:any, idle:any;
       const sessionMismatch=body.timerState==="RUNNING"&&Boolean(body.sessionId)&&activeSessionId!==body.sessionId;
-      if(activeSessionId&&(body.timerState==="STOPPED"||sessionMismatch)){
-        sessionRef=db.collection("work_sessions").doc(activeSessionId);
-        [session,idle]=await Promise.all([tx.get(sessionRef),tx.get(db.collection("idle_intervals").where("sessionId","==",activeSessionId))]);
+      // Avoid an extra session/query read on ordinary running heartbeats. We
+      // only reconcile a transition, mismatch, or a locally-running session
+      // that the stale-heartbeat job has already closed on the server.
+      const candidateSessionId=activeSessionId&&(body.timerState==="STOPPED"||sessionMismatch)?activeSessionId:!activeSessionId&&body.timerState==="RUNNING"?body.sessionId:null;
+      if(candidateSessionId){
+        sessionRef=db.collection("work_sessions").doc(candidateSessionId);
+        [session,idle]=await Promise.all([tx.get(sessionRef),tx.get(db.collection("idle_intervals").where("sessionId","==",candidateSessionId))]);
       }
       // All transaction reads are complete above. Firestore forbids reads after
       // the first write in a transaction.
-      tx.update(d.ref,{lastHeartbeatAt:now,lastSyncAt:now,agentVersion:body.agentVersion,timerState:body.timerState});
       const s=session?.data();
-      if(!s||s.status!=="ACTIVE"||s.deviceId!==d.deviceId)return null;
+      const forceStop=body.timerState==="RUNNING"&&body.sessionId&&s&&s.deviceId===d.deviceId&&s.status!=="ACTIVE"?{at:Number(s.stoppedAt??now),reason:String(s.closedBy??"SERVER_RECONCILIATION")}:null;
+      const timerState=forceStop?"STOPPED":body.timerState;
+      tx.update(d.ref,{lastHeartbeatAt:now,lastSyncAt:now,agentVersion:body.agentVersion,timerState});
+      if(!s||s.status!=="ACTIVE"||s.deviceId!==d.deviceId)return {totals:null,forceStop,timerState};
+      if(!(activeSessionId&&(body.timerState==="STOPPED"||sessionMismatch)))return {totals:null,forceStop:null,timerState};
       const stoppedAt=Math.max(Number(s.startedAt),Math.min(now,body.timerStateAt??now));
       const intervals=idle.docs.map((interval:any)=>{const value=interval.data();return {startedAt:new Date(value.startedAt),endedAt:new Date(value.endedAt??stoppedAt)};});
       const totals=calculateTimeTotals({startedAt:new Date(s.startedAt),endedAt:new Date(stoppedAt)},intervals);
       idle.docs.filter((interval:any)=>!interval.data().endedAt).forEach((interval:any)=>tx.update(interval.ref,{endedAt:stoppedAt}));
-      tx.update(sessionRef,{stoppedAt,status:"COMPLETED",...totals,updatedAt:now,closedBy:body.timerState==="STOPPED"?"STOPPED_HEARTBEAT":"SESSION_RECONCILIATION"});
+      tx.update(sessionRef,{stoppedAt,status:"COMPLETED",...totals,updatedAt:now,closedBy:body.timerState==="STOPPED"?(body.stopReason==="INACTIVITY"?"AGENT_INACTIVITY_AUTO_STOP":"STOPPED_HEARTBEAT"):"SESSION_RECONCILIATION"});
       tx.update(d.employeeRef,{activeSessionId:null});
-      return totals;
+      return {totals,forceStop:null,timerState};
     });
-    await patchDashboardEmployee(d.companyId,d.employeeId,{deviceStatus:"ONLINE",timerStatus:body.timerState,workStatus:body.timerState==="RUNNING"?"WORKING":"NOT_WORKING",device:{id:d.deviceId,name:d.data.name,platform:d.data.platform,status:"ACTIVE",lastHeartbeatAt:Date.now(),timerState:body.timerState,agentVersion:body.agentVersion}});
-    if(stopped) await addDashboardTime(d.companyId,d.employeeId,stopped);
-    return {received:true};
+    await patchDashboardEmployee(d.companyId,d.employeeId,{deviceStatus:"ONLINE",timerStatus:reconciliation.timerState,workStatus:reconciliation.timerState==="RUNNING"?"WORKING":"NOT_WORKING",device:{id:d.deviceId,name:d.data.name,platform:d.data.platform,status:"ACTIVE",lastHeartbeatAt:Date.now(),timerState:reconciliation.timerState,agentVersion:body.agentVersion}});
+    if(reconciliation.totals) await addDashboardTime(d.companyId,d.employeeId,reconciliation.totals);
+    return {received:true,forceStop:reconciliation.forceStop};
   });
   app.post("/v1/device/sessions/start",async request=>{
     const d=await requireDevice(request), body=eventInput.parse(request.body), ref=db.collection("work_sessions").doc(body.sessionId);
@@ -127,7 +134,7 @@ export async function deviceRoutes(app:FastifyInstance) {
     return {saved:true};
   });
   app.post("/v1/device/sessions/stop",async request=>{
-    const d=await requireDevice(request), body=eventInput.parse(request.body), ref=db.collection("work_sessions").doc(body.sessionId);
+    const d=await requireDevice(request), body=eventInput.extend({stopReason:z.enum(["MANUAL","INACTIVITY"]).default("MANUAL")}).parse(request.body), ref=db.collection("work_sessions").doc(body.sessionId);
     const result=await db.runTransaction(async tx=>{
       const [session,device,idle]=await Promise.all([tx.get(ref),tx.get(d.ref),tx.get(db.collection("idle_intervals").where("sessionId","==",body.sessionId))]);const s=session.data();
       if(device.data()?.status==="REVOKED")deviceFailure("DEVICE_REVOKED","This device has been revoked.");
@@ -136,7 +143,7 @@ export async function deviceRoutes(app:FastifyInstance) {
       if(body.at<s.startedAt)fail(400,"Stop precedes start.");
       const intervals=idle.docs.map(doc=>{const i=doc.data();if(!i.endedAt)tx.update(doc.ref,{endedAt:body.at});return {startedAt:new Date(i.startedAt),endedAt:new Date(i.endedAt??body.at)};});
       const totals=calculateTimeTotals({startedAt:new Date(s.startedAt),endedAt:new Date(body.at)},intervals);
-      tx.update(ref,{stoppedAt:body.at,status:"COMPLETED",...totals,updatedAt:Date.now()});tx.update(d.employeeRef,{activeSessionId:null});tx.update(d.ref,{timerState:"STOPPED"});
+      tx.update(ref,{stoppedAt:body.at,status:"COMPLETED",...totals,updatedAt:Date.now(),closedBy:body.stopReason==="INACTIVITY"?"AGENT_INACTIVITY_AUTO_STOP":"MANUAL"});tx.update(d.employeeRef,{activeSessionId:null});tx.update(d.ref,{timerState:"STOPPED"});
       return {sessionId:body.sessionId,...totals};
     });
     if("timerSeconds" in result) await addDashboardTime(d.companyId,d.employeeId,result as {timerSeconds:number;idleSeconds:number;effectiveSeconds:number});

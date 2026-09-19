@@ -1,5 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><OutputType>WinExe</OutputType><TargetFramework>net8.0-windows</TargetFramework><UseWindowsForms>true</UseWindowsForms><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings><AssemblyName>Workstream</AssemblyName><Version>0.2.10</Version><AssemblyVersion>0.2.10.0</AssemblyVersion><FileVersion>0.2.10.0</FileVersion></PropertyGroup>
+  <PropertyGroup><OutputType>WinExe</OutputType><TargetFramework>net8.0-windows</TargetFramework><UseWindowsForms>true</UseWindowsForms><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings><AssemblyName>Workstream</AssemblyName><Version>0.2.11</Version><AssemblyVersion>0.2.11.0</AssemblyVersion><FileVersion>0.2.11.0</FileVersion></PropertyGroup>
   <ItemGroup><PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.21" /></ItemGroup>
   <ItemGroup><FrameworkReference Include="Microsoft.AspNetCore.App" /></ItemGroup>
 </Project>

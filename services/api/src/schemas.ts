@@ -6,6 +6,7 @@ export const schedule = z.object({
   timezone, requiredDailySeconds: z.number().int().min(60).max(86400),
   workdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).transform(v => [...new Set(v)]),
   idleThresholdSeconds: z.number().int().min(30).max(3600),
+  autoStopIdleSeconds: z.number().int().min(60).max(86400).default(1800),
   monitoringMode: z.enum(["SIMPLE_TIMER","ACTIVE_MONITORING"]).default("SIMPLE_TIMER"),
   officeStart: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),
   officeEnd: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),

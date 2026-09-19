@@ -29,7 +29,7 @@ export async function signupRoutes(app: FastifyInstance) {
         tx.create(claim, { userId: user.uid, companyId: company.id, createdAt: now });
         tx.create(company, { name: companyName, ownerName, ownerUserId: user.uid, timezone, status: "ACTIVE", createdAt: now, updatedAt: now });
         tx.create(db.collection("memberships").doc(user.uid), { companyId: company.id, role: "OWNER", createdAt: now });
-        tx.create(company.collection("settings").doc("defaults"), { timezone, requiredDailySeconds: 28800, workdays: [1, 2, 3, 4, 5], idleThresholdSeconds: 30, lateStartDelaySeconds: 3600, monitoringMode: "SIMPLE_TIMER" });
+        tx.create(company.collection("settings").doc("defaults"), { timezone, requiredDailySeconds: 28800, workdays: [1, 2, 3, 4, 5], idleThresholdSeconds: 30, autoStopIdleSeconds: 1800, lateStartDelaySeconds: 3600, monitoringMode: "SIMPLE_TIMER" });
         tx.create(company.collection("settings").doc("employerAlerts"), defaultEmployerAlerts);
         tx.create(company.collection("settings").doc("employeeAlerts"), defaultEmployeeAlerts);
         tx.create(db.collection("audit_logs").doc(), { companyId: company.id, actorUserId: user.uid, action: "COMPANY_CREATED", targetId: company.id, createdAt: now });

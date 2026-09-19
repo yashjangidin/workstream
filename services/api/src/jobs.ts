@@ -7,6 +7,8 @@ import {notificationRecord,processNotifications} from './notifications.js';
 import {timingSafeEqual} from 'node:crypto';
 import {alertRule,reportTypes,defaultEmployerAlerts,defaultEmployeeAlerts,normaliseAlerts} from './schemas.js';
 import {deliveryChannel} from './notification-channels.js';
+import {addDashboardTime,patchDashboardEmployee} from './dashboard-summary.js';
+import {calculateTimeTotals} from '@workstream/domain';
 import {z} from 'zod';
 
 const formatDuration=(seconds:number)=>Math.floor(seconds/3600)+'h '+String(Math.floor(seconds%3600/60)).padStart(2,'0')+'m';
@@ -79,7 +81,39 @@ export async function retainScreenshots(companyId:string){
     const batch=db.batch();batch.delete(db.collection('screenshots').doc(row.id));batch.set(db.collection('audit_logs').doc(digest('retention:'+row.id)),{companyId,action:'SCREENSHOT_RETENTION',targetId:row.id,createdAt:Date.now()});await batch.commit();
   }
 }
-export async function runCompanyJobs(companyId:string){await scheduledReports(companyId);await retainScreenshots(companyId);}
+export async function reconcileStaleSessions(companyId:string){
+  // Only active sessions are candidates. This avoids rereading historical
+  // sessions, every employee, and every device on each scheduler invocation.
+  const active=await db.collection('work_sessions').where('companyId','==',companyId).where('status','==','ACTIVE').get();
+  for(const sessionSnapshot of active.docs){
+    const candidate={...sessionSnapshot.data(),id:sessionSnapshot.id} as Record<string,any>&{id:string};
+    const [deviceSnapshot,employeeSnapshot]=await Promise.all([db.collection('devices').doc(candidate.deviceId).get(),db.collection('employees').doc(candidate.employeeId).get()]);
+    const device=deviceSnapshot.exists?{...deviceSnapshot.data(),id:deviceSnapshot.id} as Record<string,any>&{id:string}:null,employee=employeeSnapshot.exists?{...employeeSnapshot.data(),id:employeeSnapshot.id} as Record<string,any>&{id:string}:null;
+    const lastHeartbeat=milliseconds(device?.lastHeartbeatAt),autoStopSeconds=Number(employee?.autoStopIdleSeconds??1800);
+    if(!device||!employee||!Number.isFinite(lastHeartbeat)||autoStopSeconds<60)continue;
+    const stoppedAt=lastHeartbeat+autoStopSeconds*1000;
+    if(Date.now()<stoppedAt)continue;
+    const sessionRef=db.collection('work_sessions').doc(candidate.id),employeeRef=db.collection('employees').doc(candidate.employeeId),deviceRef=db.collection('devices').doc(candidate.deviceId),fallbackIdleRef=db.collection('idle_intervals').doc(digest('stale-idle:'+candidate.id));
+    const result=await db.runTransaction(async tx=>{
+      const [sessionDoc,employeeDoc,deviceDoc,idleDocs,fallbackIdle]=await Promise.all([tx.get(sessionRef),tx.get(employeeRef),tx.get(deviceRef),tx.get(db.collection('idle_intervals').where('sessionId','==',candidate.id)),tx.get(fallbackIdleRef)]);
+      const session=sessionDoc.data();
+      if(!session||session.status!=='ACTIVE'||employeeDoc.data()?.activeSessionId!==candidate.id)return null;
+      const idleStart=Math.max(Number(session.startedAt),lastHeartbeat),open=idleDocs.docs.find(doc=>!doc.data().endedAt);
+      const intervals=idleDocs.docs.map(doc=>{const value=doc.data();return {startedAt:new Date(value.startedAt),endedAt:new Date(value.endedAt??stoppedAt)};});
+      if(!open&&!fallbackIdle.exists)intervals.push({startedAt:new Date(idleStart),endedAt:new Date(stoppedAt)});
+      const totals=calculateTimeTotals({startedAt:new Date(session.startedAt),endedAt:new Date(stoppedAt)},intervals);
+      for(const interval of idleDocs.docs)if(!interval.data().endedAt)tx.update(interval.ref,{endedAt:stoppedAt,closedBy:'STALE_HEARTBEAT_AUTO_STOP'});
+      if(!open&&!fallbackIdle.exists)tx.create(fallbackIdleRef,{companyId,employeeId:candidate.employeeId,deviceId:candidate.deviceId,sessionId:candidate.id,startedAt:idleStart,endedAt:stoppedAt,closedBy:'STALE_HEARTBEAT_AUTO_STOP'});
+      tx.update(sessionRef,{stoppedAt,status:'COMPLETED',...totals,updatedAt:Date.now(),closedBy:'STALE_HEARTBEAT_AUTO_STOP'});
+      tx.update(employeeRef,{activeSessionId:null});tx.update(deviceRef,{timerState:'STOPPED'});
+      return totals;
+    });
+    if(!result)continue;
+    await addDashboardTime(companyId,candidate.employeeId,result);
+    await patchDashboardEmployee(companyId,candidate.employeeId,{deviceStatus:'OFFLINE',timerStatus:'STOPPED',workStatus:'OFFLINE',activeIdleStartedAt:null,device:{id:device.id,name:device.name,platform:device.platform,status:device.status,lastHeartbeatAt:device.lastHeartbeatAt,lastSyncAt:device.lastSyncAt,timerState:'STOPPED',agentVersion:device.agentVersion}});
+  }
+}
+export async function runCompanyJobs(companyId:string){await reconcileStaleSessions(companyId);await scheduledReports(companyId);await retainScreenshots(companyId);}
 export async function jobsRoutes(app:FastifyInstance){
   app.post('/v1/jobs/run',async request=>{
     const provided=request.headers.authorization?.replace(/^Bearer /,'')??'',configured=process.env.SCHEDULER_SECRET??'';

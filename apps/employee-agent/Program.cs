@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using System.Drawing.Imaging;
 using Microsoft.Data.Sqlite;
+using Microsoft.Win32;
 
 namespace Workstream.Agent;
 
@@ -29,6 +30,7 @@ internal sealed class State {
     public string Timezone {get;set;}="UTC";
     public int RequiredDailySeconds {get;set;}=28800;
     public int IdleThresholdSeconds {get;set;}=30;
+    public int AutoStopIdleSeconds {get;set;}=1800;
     public int HeartbeatSeconds {get;set;}=60;
     public string MonitoringMode {get;set;}="SIMPLE_TIMER";
     public string? SessionId {get;set;}
@@ -38,6 +40,9 @@ internal sealed class State {
     public long IdleMilliseconds {get;set;}
     public long LastAuthorizedAt {get;set;}
     public long TimerStateChangedAt {get;set;}
+    public long SystemIdleStartedAt {get;set;}
+    public string LastTimerNotice {get;set;}="";
+    public string TimerStopReason {get;set;}="MANUAL";
 }
 internal sealed class Store : IDisposable {
     public readonly string DirectoryPath;
@@ -45,15 +50,17 @@ internal sealed class Store : IDisposable {
     private SqliteTransaction? transaction;
     public void Atomic(Action action){using var tx=connection.BeginTransaction();transaction=tx;try{action();tx.Commit();}finally{transaction=null;}}
     public void Quarantine(long id,string reason){using var cmd=connection.CreateCommand();cmd.CommandText="INSERT INTO rejected SELECT id,path,body,image,$reason FROM queue WHERE id=$id; DELETE FROM queue WHERE id=$id";cmd.Parameters.AddWithValue("$reason",reason);cmd.Parameters.AddWithValue("$id",id);cmd.ExecuteNonQuery();}
-    public Store(string? directory=null){DirectoryPath=directory??Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"Workstream");Directory.CreateDirectory(DirectoryPath); connection=new SqliteConnection("Data Source="+Path.Combine(DirectoryPath,"agent.db")); connection.Open(); using var cmd=connection.CreateCommand();cmd.CommandText="PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY, data BLOB NOT NULL); CREATE TABLE IF NOT EXISTS queue(id INTEGER PRIMARY KEY AUTOINCREMENT,path TEXT NOT NULL,body TEXT NOT NULL,image TEXT); CREATE TABLE IF NOT EXISTS rejected(id INTEGER PRIMARY KEY,path TEXT,body TEXT,image TEXT,reason TEXT); CREATE TABLE IF NOT EXISTS uploaded(path TEXT PRIMARY KEY, day TEXT NOT NULL);";cmd.ExecuteNonQuery();}
+    public Store(string? directory=null){DirectoryPath=directory??Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"Workstream");Directory.CreateDirectory(DirectoryPath); connection=new SqliteConnection("Data Source="+Path.Combine(DirectoryPath,"agent.db")); connection.Open(); using var cmd=connection.CreateCommand();cmd.CommandText="PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY, data BLOB NOT NULL); CREATE TABLE IF NOT EXISTS queue(id INTEGER PRIMARY KEY AUTOINCREMENT,path TEXT NOT NULL,body TEXT NOT NULL,image TEXT); CREATE TABLE IF NOT EXISTS rejected(id INTEGER PRIMARY KEY,path TEXT,body TEXT,image TEXT,reason TEXT); CREATE TABLE IF NOT EXISTS uploaded(path TEXT PRIMARY KEY, day TEXT NOT NULL); CREATE TABLE IF NOT EXISTS timer_log(id INTEGER PRIMARY KEY AUTOINCREMENT,occurred_at INTEGER NOT NULL,event TEXT NOT NULL,details TEXT NOT NULL);";cmd.ExecuteNonQuery();}
     public State Load(){using var cmd=connection.CreateCommand();cmd.CommandText="SELECT data FROM state WHERE id=1";var bytes=cmd.ExecuteScalar() as byte[];return bytes==null?new():JsonSerializer.Deserialize<State>(ProtectedData.Unprotect(bytes,null,DataProtectionScope.CurrentUser))??new();}
     public void Save(State state){var bytes=ProtectedData.Protect(JsonSerializer.SerializeToUtf8Bytes(state),null,DataProtectionScope.CurrentUser);using var cmd=connection.CreateCommand();cmd.Transaction=transaction;cmd.CommandText="INSERT OR REPLACE INTO state(id,data) VALUES(1,$data)";cmd.Parameters.AddWithValue("$data",bytes);cmd.ExecuteNonQuery();}
     public void Add(string path,object body,string? image=null){using var cmd=connection.CreateCommand();cmd.Transaction=transaction;cmd.CommandText="INSERT INTO queue(path,body,image) VALUES($path,$body,$image)";cmd.Parameters.AddWithValue("$path",path);cmd.Parameters.AddWithValue("$body",JsonSerializer.Serialize(body));cmd.Parameters.AddWithValue("$image",(object?)image??DBNull.Value);cmd.ExecuteNonQuery();}
+    public void AddLog(long occurredAt,string eventName,string details){using var cmd=connection.CreateCommand();cmd.Transaction=transaction;cmd.CommandText="INSERT INTO timer_log(occurred_at,event,details) VALUES($at,$event,$details); DELETE FROM timer_log WHERE id NOT IN (SELECT id FROM timer_log ORDER BY id DESC LIMIT 50);";cmd.Parameters.AddWithValue("$at",occurredAt);cmd.Parameters.AddWithValue("$event",eventName);cmd.Parameters.AddWithValue("$details",details);cmd.ExecuteNonQuery();}
+    public string RecentLogs(){var lines=new List<string>();using var cmd=connection.CreateCommand();cmd.CommandText="SELECT occurred_at,event,details FROM timer_log ORDER BY id DESC LIMIT 4";using var r=cmd.ExecuteReader();while(r.Read()){var time=DateTimeOffset.FromUnixTimeMilliseconds(r.GetInt64(0)).ToLocalTime().ToString("dd MMM, HH:mm");lines.Add(time+"  ·  "+r.GetString(1)+(string.IsNullOrWhiteSpace(r.GetString(2))?"":" — "+r.GetString(2)));}return lines.Count==0?"No timer activity yet.":string.Join(Environment.NewLine,lines);}
     public (long Id,string Path,string Body,string? Image)? First(){using var cmd=connection.CreateCommand();cmd.CommandText="SELECT id,path,body,image FROM queue ORDER BY CASE WHEN path IN ('/v1/device/sessions/start','/v1/device/idle','/v1/device/sessions/stop') THEN 0 ELSE 1 END,id LIMIT 1";using var r=cmd.ExecuteReader();return r.Read()?(r.GetInt64(0),r.GetString(1),r.GetString(2),r.IsDBNull(3)?null:r.GetString(3)):null;}
     public void Complete(long id,string? image){using var tx=connection.BeginTransaction();using var cmd=connection.CreateCommand();cmd.Transaction=tx;cmd.CommandText="DELETE FROM queue WHERE id=$id";cmd.Parameters.AddWithValue("$id",id);cmd.ExecuteNonQuery();if(image!=null){cmd.Parameters.Clear();cmd.CommandText="INSERT OR REPLACE INTO uploaded(path,day) VALUES($path,$day)";cmd.Parameters.AddWithValue("$path",image);cmd.Parameters.AddWithValue("$day",DateTime.Today.ToString("yyyy-MM-dd"));cmd.ExecuteNonQuery();}tx.Commit();}
     public void Cleanup(){var paths=new List<string>();using(var cmd=connection.CreateCommand()){cmd.CommandText="SELECT path FROM uploaded WHERE day < $today";cmd.Parameters.AddWithValue("$today",DateTime.Today.ToString("yyyy-MM-dd"));using var r=cmd.ExecuteReader();while(r.Read())paths.Add(r.GetString(0));}foreach(var path in paths){var full=Path.GetFullPath(path);if(!full.StartsWith(Path.GetFullPath(DirectoryPath)+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase))continue;if(File.Exists(full))File.Delete(full);using var cmd=connection.CreateCommand();cmd.CommandText="DELETE FROM uploaded WHERE path=$path";cmd.Parameters.AddWithValue("$path",path);cmd.ExecuteNonQuery();}}
     public void ResetAuthorization(State next){
-        Atomic(()=>{using var cmd=connection.CreateCommand();cmd.Transaction=transaction;cmd.CommandText="DELETE FROM queue; DELETE FROM rejected; DELETE FROM uploaded;";cmd.ExecuteNonQuery();Save(next);});
+        Atomic(()=>{using var cmd=connection.CreateCommand();cmd.Transaction=transaction;cmd.CommandText="DELETE FROM queue; DELETE FROM rejected; DELETE FROM uploaded; DELETE FROM timer_log;";cmd.ExecuteNonQuery();Save(next);});
         foreach(var path in Directory.EnumerateFiles(DirectoryPath,"*.capture")){try{File.Delete(path);}catch(IOException){}}
     }
     public void DiscardScreenshotUploads(){
@@ -63,7 +70,7 @@ internal sealed class Store : IDisposable {
     public void Dispose()=>connection.Dispose();
 }
 internal sealed class AgentForm:Form {
-    const string AgentVersion="0.2.10";
+    const string AgentVersion="0.2.11";
     const bool ScreenshotUploadsEnabled=false;
     readonly BrowserBridge bridge=new();
     readonly Button browserPair=new(){Text="Copy browser pairing key",Width=320},correction=new(){Text="Request time correction",Width=320};
@@ -71,13 +78,14 @@ internal sealed class AgentForm:Form {
     readonly Label name=new(){AutoSize=true}, status=new(){AutoSize=true}, timerLabel=new(){AutoSize=true,Font=new Font("Segoe UI",17,FontStyle.Bold)}, monitoring=new(){AutoSize=true,MaximumSize=new Size(340,0)}, warning=new(){AutoSize=true,MaximumSize=new Size(340,0)};
     readonly TextBox url=new(){Width=320},code=new(){Width=320,PlaceholderText="Employee setup code",UseSystemPasswordChar=true};
     readonly Button pair=new(){Text="Connect",Width=320},toggle=new(){Text="START TIMER",Width=320,Height=40};
-    readonly Panel sessionCard=Card();
+    readonly Panel sessionCard=Card(),logCard=new(){Width=402,Height=124,BackColor=Color.White,BorderStyle=BorderStyle.FixedSingle,Margin=new Padding(0,4,0,0)};
+    readonly Label logTitle=new(){Text="RECENT TIMER LOGS",AutoSize=true},logText=new(){AutoSize=true,MaximumSize=new Size(360,0)};
     readonly Panel noticeCard=NoticeCard();
     readonly System.Windows.Forms.Timer tick=new(){Interval=1000};
     readonly NotifyIcon trayIcon=new();
     Icon? appIcon;
     long SyncIntervalMilliseconds=>Math.Max(30,state.HeartbeatSeconds)*1000L;
-    bool syncing=false,closing=false,closed=false,syncBlocked=false; AuthorizationStatus authorization; int rejected=0;long lastSync=0,lastCapture=0,activityAt=0;string application="",activeDomain="";
+    bool syncing=false,closing=false,closed=false,syncBlocked=false,screenSaverWasRunning=false; AuthorizationStatus authorization; int rejected=0;long lastSync=0,lastCapture=0,activityAt=0;string application="",activeDomain="";
     static long Now=>DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     public AgentForm(){
         state=store.Load();
@@ -92,12 +100,13 @@ internal sealed class AgentForm:Form {
         correction.Click+=(_,_)=>RequestCorrection();
         Shown+=async(_,_)=>{try{await bridge.Start(state.BrowserSecret);}catch{warning.Text="Browser bridge could not start. Timer tracking remains available.";} if(state.DeviceId!="")await RevalidateAuthorization();};
         pair.Click+=async(_,_)=>await Enroll();toggle.Click+=async(_,_)=>await Toggle();tick.Tick+=async(_,_)=>await Tick();tick.Start();
+        SystemEvents.SessionSwitch+=SessionChanged;SystemEvents.PowerModeChanged+=PowerChanged;
         Resize+=(_,_)=>{if(WindowState==FormWindowState.Minimized){Hide();trayIcon.ShowBalloonTip(1500,"Workstream","Workstream is still running in the notification area.",ToolTipIcon.Info);}};
-        FormClosing+=async(_,e)=>{if(closed)return;e.Cancel=true;if(closing)return;closing=true;tick.Stop();http.CancelPendingRequests();while(syncing)await Task.Delay(20);await bridge.Stop();store.Save(state);store.Dispose();http.Dispose();trayIcon.Visible=false;trayIcon.Dispose();appIcon?.Dispose();closed=true;Close();};
+        FormClosing+=async(_,e)=>{if(closed)return;e.Cancel=true;if(closing)return;closing=true;tick.Stop();SystemEvents.SessionSwitch-=SessionChanged;SystemEvents.PowerModeChanged-=PowerChanged;http.CancelPendingRequests();while(syncing)await Task.Delay(20);await bridge.Stop();store.Save(state);store.Dispose();http.Dispose();trayIcon.Visible=false;trayIcon.Dispose();appIcon?.Dispose();closed=true;Close();};
         Render();
     }
     void BuildWindow(){
-        Text="Workstream"; ClientSize=new Size(454,610); MinimumSize=new Size(454,610); StartPosition=FormStartPosition.CenterScreen; BackColor=Color.FromArgb(246,249,247); Font=new Font("Segoe UI",9.5f); Icon=appIcon=CreateAppIcon();
+        Text="Workstream"; ClientSize=new Size(454,760); MinimumSize=new Size(454,650); StartPosition=FormStartPosition.CenterScreen; BackColor=Color.FromArgb(246,249,247); Font=new Font("Segoe UI",9.5f); Icon=appIcon=CreateAppIcon();
         var menu=new ContextMenuStrip(); menu.Items.Add("Open Workstream",null,(_,_)=>ShowFromTray()); menu.Items.Add("Exit",null,(_,_)=>Close());
         trayIcon.Icon=appIcon;trayIcon.Text="Workstream";trayIcon.ContextMenuStrip=menu;trayIcon.Visible=true;trayIcon.DoubleClick+=(_,_)=>ShowFromTray();
         var root=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=1,RowCount=2,BackColor=BackColor,Padding=new Padding(22)};root.RowStyles.Add(new RowStyle(SizeType.AutoSize));root.RowStyles.Add(new RowStyle(SizeType.Percent,100));
@@ -112,7 +121,8 @@ internal sealed class AgentForm:Form {
         monitoring.ForeColor=Color.FromArgb(72,91,83);monitoring.Margin=new Padding(18,0,18,12);warning.ForeColor=Color.FromArgb(132,79,26);warning.Location=new Point(13,11);warning.MaximumSize=new Size(366,0);noticeCard.Controls.Add(warning);
         StyleButton(toggle,true);StyleButton(browserPair,false);StyleButton(correction,false);StyleButton(pair,true);url.Margin=new Padding(8,8,8,4);code.Margin=new Padding(8,4,8,8);
         sessionCard.Controls.AddRange([timerLabel,monitoring]);
-        content.Controls.AddRange([name,status,url,code,pair,sessionCard,toggle,browserPair,correction,noticeCard]);root.Controls.Add(content,0,1);Controls.Add(root);
+        logTitle.Font=new Font("Segoe UI",10,FontStyle.Bold);logTitle.ForeColor=Color.FromArgb(22,59,47);logTitle.Location=new Point(16,13);logText.ForeColor=Color.FromArgb(72,91,83);logText.Font=new Font("Segoe UI",8.5f);logText.Location=new Point(16,39);logCard.Controls.AddRange([logTitle,logText]);
+        content.Controls.AddRange([name,status,url,code,pair,sessionCard,toggle,browserPair,correction,logCard,noticeCard]);root.Controls.Add(content,0,1);Controls.Add(root);
     }
     static Panel Card(){return new Panel{Width=402,Height=158,BackColor=Color.White,BorderStyle=BorderStyle.FixedSingle,Margin=new Padding(0,0,0,14)};}
     static Panel NoticeCard(){return new Panel{Width=402,Height=58,BackColor=Color.FromArgb(255,247,232),BorderStyle=BorderStyle.FixedSingle,Margin=new Padding(0,4,0,0)};}
@@ -141,7 +151,7 @@ internal sealed class AgentForm:Form {
         return JsonDocument.Parse(text).RootElement.Clone();
     }
     bool CanOperate()=>AuthorizationGate.CanOperate(authorization,state.DeviceId,state.LastAuthorizedAt,Now)&&!closing;
-    void ClearAuthorizationState(){state.ApiUrl=Deployment.ApiUrl;state.Credential="";state.DeviceId="";state.EmployeeName="";state.BrowserSecret=Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));state.Timezone="UTC";state.RequiredDailySeconds=28800;state.IdleThresholdSeconds=30;state.HeartbeatSeconds=60;state.MonitoringMode="SIMPLE_TIMER";state.SessionId=null;state.StartedAt=0;state.IdleId=null;state.IdleStartedAt=0;state.IdleMilliseconds=0;state.LastAuthorizedAt=0;state.TimerStateChangedAt=0;application="";activeDomain="";activityAt=0;lastCapture=0;bridge.Enabled=false;}
+    void ClearAuthorizationState(){state.ApiUrl=Deployment.ApiUrl;state.Credential="";state.DeviceId="";state.EmployeeName="";state.BrowserSecret=Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));state.Timezone="UTC";state.RequiredDailySeconds=28800;state.IdleThresholdSeconds=30;state.AutoStopIdleSeconds=1800;state.HeartbeatSeconds=60;state.MonitoringMode="SIMPLE_TIMER";state.SessionId=null;state.StartedAt=0;state.IdleId=null;state.IdleStartedAt=0;state.IdleMilliseconds=0;state.LastAuthorizedAt=0;state.TimerStateChangedAt=0;state.SystemIdleStartedAt=0;state.LastTimerNotice="";state.TimerStopReason="MANUAL";application="";activeDomain="";activityAt=0;lastCapture=0;bridge.Enabled=false;}
     void Revoke(string reason){authorization=AuthorizationStatus.Revoked;ClearAuthorizationState();store.ResetAuthorization(state);authorization=AuthorizationStatus.SetupRequired;warning.Text=reason+" Connect this computer using a new employee setup code.";Render();}
     async Task RevalidateAuthorization(){if(state.DeviceId==""||state.Credential=="")return;authorization=AuthorizationStatus.Connecting;Render();await Sync();}
     async Task Toggle(){
@@ -149,30 +159,35 @@ internal sealed class AgentForm:Form {
         if(state.SessionId==null){await Sync();if(!CanOperate()||syncBlocked)return;}
         store.Atomic(()=>{
             if(state.SessionId==null){
-                state.SessionId=Guid.NewGuid().ToString("N");state.StartedAt=Now;state.TimerStateChangedAt=state.StartedAt;state.IdleMilliseconds=0;
+                state.SessionId=Guid.NewGuid().ToString("N");state.StartedAt=Now;state.TimerStateChangedAt=state.StartedAt;state.IdleMilliseconds=0;state.SystemIdleStartedAt=0;state.LastTimerNotice="";state.TimerStopReason="MANUAL";warning.Text="";
                 store.Add("/v1/device/sessions/start",new{operationId=Guid.NewGuid().ToString("N"),sessionId=state.SessionId,at=state.StartedAt});
+                store.AddLog(state.StartedAt,"Timer started","");
                 lastCapture=Now;activityAt=Now;application=Foreground();activeDomain=BrowserDomain(application);
             }else{
-                CloseIdle();FlushActivity();var stoppedAt=Now;store.Add("/v1/device/sessions/stop",new{operationId=Guid.NewGuid().ToString("N"),sessionId=state.SessionId,at=stoppedAt});state.SessionId=null;state.TimerStateChangedAt=stoppedAt;
+                StopSession(Now,"MANUAL");
             }
             store.Save(state);
         });Render();lastSync=0;
     }
-    void CloseIdle(){if(!CanOperate()||state.IdleId==null)return;store.Add("/v1/device/idle",new{operationId=Guid.NewGuid().ToString("N"),sessionId=state.SessionId,idleId=state.IdleId,at=state.IdleStartedAt,endedAt=Now});state.IdleMilliseconds+=Now-state.IdleStartedAt;state.IdleId=null;}
+    void EnsureIdle(long startedAt){if(state.SessionId==null||state.IdleId!=null)return;state.IdleId=Guid.NewGuid().ToString("N");state.IdleStartedAt=Math.Max(state.StartedAt,startedAt);store.Add("/v1/device/idle",new{operationId=Guid.NewGuid().ToString("N"),sessionId=state.SessionId,idleId=state.IdleId,at=state.IdleStartedAt,endedAt=(long?)null});}
+    void CloseIdle(long endedAt){if(state.SessionId==null||state.IdleId==null)return;var stop=Math.Max(state.IdleStartedAt,endedAt);store.Add("/v1/device/idle",new{operationId=Guid.NewGuid().ToString("N"),sessionId=state.SessionId,idleId=state.IdleId,at=state.IdleStartedAt,endedAt=stop});state.IdleMilliseconds+=stop-state.IdleStartedAt;state.IdleId=null;state.IdleStartedAt=0;}
+    void StopSession(long stoppedAt,string reason){if(state.SessionId==null)return;CloseIdle(stoppedAt);FlushActivity();var sessionId=state.SessionId;store.Add("/v1/device/sessions/stop",new{operationId=Guid.NewGuid().ToString("N"),sessionId,at=stoppedAt,stopReason=reason});store.AddLog(stoppedAt,reason=="INACTIVITY"?"Timer auto-stopped":"Timer stopped",reason=="INACTIVITY"?$"After {Math.Max(1,state.AutoStopIdleSeconds/60)} minutes idle":"");state.SessionId=null;state.TimerStateChangedAt=stoppedAt;state.SystemIdleStartedAt=0;state.TimerStopReason=reason;if(reason=="INACTIVITY")state.LastTimerNotice=$"Timer stopped after {Math.Max(1,state.AutoStopIdleSeconds/60)} minutes of inactivity. Start the timer when you are ready to work again.";}
     void FlushActivity(){if(CanOperate()&&state.SessionId!=null&&state.MonitoringMode=="ACTIVE_MONITORING"&&activityAt>0&&Now>activityAt)store.Add("/v1/device/activity",new{operationId=Guid.NewGuid().ToString("N"),sessionId=state.SessionId,at=activityAt,endedAt=Now,application,domain=activeDomain});activityAt=Now;}
     async Task Tick(){
         if(closing){Render();return;}
         if(!CanOperate()){Render();if(!syncing&&state.DeviceId!=""&&authorization!=AuthorizationStatus.SetupRequired&&Now-lastSync>=SyncIntervalMilliseconds){lastSync=Now;await Sync();}return;}
-        if(state.SessionId!=null){var idleFor=IdleMilliseconds();if(idleFor>=state.IdleThresholdSeconds*1000L&&state.IdleId==null){store.Atomic(()=>{state.IdleId=Guid.NewGuid().ToString("N");state.IdleStartedAt=Math.Max(state.StartedAt,Now-idleFor);store.Add("/v1/device/idle",new{operationId=Guid.NewGuid().ToString("N"),sessionId=state.SessionId,idleId=state.IdleId,at=state.IdleStartedAt,endedAt=(long?)null});store.Save(state);});}else if(idleFor<1000&&state.IdleId!=null){store.Atomic(()=>{CloseIdle();store.Save(state);});}if(state.MonitoringMode=="ACTIVE_MONITORING"){var foreground=Foreground();var domain=BrowserDomain(foreground);if(foreground!=application||domain!=activeDomain||Now-activityAt>=15000){FlushActivity();application=foreground;activeDomain=domain;}if(ScreenshotUploadsEnabled&&Now-lastCapture>=30000){lastCapture=Now;CaptureScreenshot();}}}
+        var screenSaver=ScreenSaverRunning();if(screenSaver&&!screenSaverWasRunning)BeginSystemInactivity("Screen saver");else if(!screenSaver&&screenSaverWasRunning)EndSystemInactivity();screenSaverWasRunning=screenSaver;
+        if(state.SessionId!=null){var idleFor=IdleMilliseconds();if(idleFor>=state.IdleThresholdSeconds*1000L&&state.IdleId==null){store.Atomic(()=>{EnsureIdle(Now-idleFor);store.Save(state);});}else if(idleFor<1000&&state.IdleId!=null&&state.SystemIdleStartedAt==0&&!screenSaver){store.Atomic(()=>{CloseIdle(Now);store.Save(state);});}if(state.IdleId!=null&&Now-state.IdleStartedAt>=Math.Max(60,state.AutoStopIdleSeconds)*1000L){var stoppedAt=state.IdleStartedAt+Math.Max(60,state.AutoStopIdleSeconds)*1000L;store.Atomic(()=>{StopSession(stoppedAt,"INACTIVITY");store.Save(state);});warning.Text=state.LastTimerNotice;lastSync=0;}if(state.SessionId!=null&&state.MonitoringMode=="ACTIVE_MONITORING"){var foreground=Foreground();var domain=BrowserDomain(foreground);if(foreground!=application||domain!=activeDomain||Now-activityAt>=15000){FlushActivity();application=foreground;activeDomain=domain;}if(ScreenshotUploadsEnabled&&Now-lastCapture>=30000){lastCapture=Now;CaptureScreenshot();}}}
         Render();if(!syncing&&state.DeviceId!=""&&Now-lastSync>=SyncIntervalMilliseconds){lastSync=Now;await Sync();}
     }
     void CaptureScreenshot(){try{if(!CanOperate()||state.SessionId==null||state.MonitoringMode!="ACTIVE_MONITORING")return;var size=Directory.EnumerateFiles(store.DirectoryPath,"*.capture").Sum(p=>new FileInfo(p).Length);if(size>250L*1024*1024){warning.Text="Screenshot queue is full. Unsent images are retained; capture resumes after sync and cleanup.";return;}var bounds=Screen.PrimaryScreen!.Bounds;using var bitmap=new Bitmap(bounds.Width,bounds.Height);using(var graphics=Graphics.FromImage(bitmap))graphics.CopyFromScreen(bounds.Location,Point.Empty,bounds.Size);var path=Path.Combine(store.DirectoryPath,Guid.NewGuid().ToString("N")+".capture");var codec=ImageCodecInfo.GetImageEncoders().First(c=>c.MimeType=="image/jpeg");using var parameters=new EncoderParameters(1);parameters.Param[0]=new EncoderParameter(System.Drawing.Imaging.Encoder.Quality,55L);using var stream=new MemoryStream();bitmap.Save(stream,codec,parameters);File.WriteAllBytes(path,ProtectedData.Protect(stream.ToArray(),null,DataProtectionScope.CurrentUser));store.Add("/v1/device/screenshots",new{operationId=Guid.NewGuid().ToString("N"),sessionId=state.SessionId,at=Now,application,domain=BrowserDomain(application)},path);}catch{warning.Text="Screenshot capture failed. Timer continues.";}}
     async Task Sync(){
         if(syncing)return; syncing=true;syncBlocked=false;
         try{
-            await Send("/v1/device/heartbeat",HttpMethod.Post,JsonSerializer.Serialize(new{agentVersion=AgentVersion,timerState=state.SessionId==null?"STOPPED":"RUNNING",sessionId=state.SessionId,timerStateAt=state.TimerStateChangedAt>0?state.TimerStateChangedAt:Now}));
+            var heartbeat=await Send("/v1/device/heartbeat",HttpMethod.Post,JsonSerializer.Serialize(new{agentVersion=AgentVersion,timerState=state.SessionId==null?"STOPPED":"RUNNING",sessionId=state.SessionId,timerStateAt=state.TimerStateChangedAt>0?state.TimerStateChangedAt:Now,stopReason=state.SessionId==null?state.TimerStopReason:null}));
+            if(heartbeat.TryGetProperty("forceStop",out var forced)&&forced.ValueKind==JsonValueKind.Object&&state.SessionId!=null){var stoppedAt=forced.TryGetProperty("at",out var at)?at.GetInt64():Now;store.Atomic(()=>{store.AddLog(stoppedAt,"Timer auto-stopped","Server detected a stale heartbeat");state.SessionId=null;state.TimerStateChangedAt=stoppedAt;state.IdleId=null;state.IdleStartedAt=0;state.IdleMilliseconds=0;state.SystemIdleStartedAt=0;state.TimerStopReason="INACTIVITY";state.LastTimerNotice=$"Timer stopped after {Math.Max(1,state.AutoStopIdleSeconds/60)} minutes of inactivity. Start the timer when you are ready to work again.";store.Save(state);});warning.Text=state.LastTimerNotice;}
             var conf=await Send("/v1/device/config",HttpMethod.Get);const string mode="SIMPLE_TIMER";
-            if(mode!=state.MonitoringMode){activityAt=Now;lastCapture=Now;}state.MonitoringMode=mode;state.EmployeeName=conf.GetProperty("employeeName").GetString()!;state.IdleThresholdSeconds=conf.GetProperty("idleThresholdSeconds").GetInt32();state.RequiredDailySeconds=conf.GetProperty("requiredDailySeconds").GetInt32();state.HeartbeatSeconds=conf.GetProperty("heartbeatSeconds").GetInt32();state.Timezone=conf.GetProperty("timezone").GetString()!;state.LastAuthorizedAt=Now;authorization=AuthorizationStatus.Authorized;store.Save(state);
+            if(mode!=state.MonitoringMode){activityAt=Now;lastCapture=Now;}state.MonitoringMode=mode;state.EmployeeName=conf.GetProperty("employeeName").GetString()!;state.IdleThresholdSeconds=conf.GetProperty("idleThresholdSeconds").GetInt32();state.AutoStopIdleSeconds=conf.TryGetProperty("autoStopIdleSeconds",out var autoStop)?autoStop.GetInt32():1800;state.RequiredDailySeconds=conf.GetProperty("requiredDailySeconds").GetInt32();state.HeartbeatSeconds=conf.GetProperty("heartbeatSeconds").GetInt32();state.Timezone=conf.GetProperty("timezone").GetString()!;state.LastAuthorizedAt=Now;authorization=AuthorizationStatus.Authorized;store.Save(state);
             var monitoringRetry=false;
             for(var count=0;count<50;count++){
                 var item=store.First();if(item==null)break;var body=item.Value.Body;
@@ -181,7 +196,7 @@ internal sealed class AgentForm:Form {
                 catch(HttpRequestException e) when((item.Value.Path.EndsWith("/screenshots")||item.Value.Path.EndsWith("/activity")) && e.StatusCode is System.Net.HttpStatusCode.BadRequest or System.Net.HttpStatusCode.Conflict or System.Net.HttpStatusCode.NotFound){store.Quarantine(item.Value.Id,e.Message);rejected++;}
                 catch(HttpRequestException) when(item.Value.Path.EndsWith("/screenshots")||item.Value.Path.EndsWith("/activity")){monitoringRetry=true;break;}
             }
-            store.Cleanup();warning.Text=monitoringRetry?"Screenshot delivery is retrying. Your timer and work-time data are synced.":rejected>0?$"{rejected} monitoring record(s) were rejected by server policy. Timer sync continues.":"";
+            store.Cleanup();warning.Text=monitoringRetry?"Screenshot delivery is retrying. Your timer and work-time data are synced.":rejected>0?$"{rejected} monitoring record(s) were rejected by server policy. Timer sync continues.":state.LastTimerNotice;
         }catch(DeviceAuthorizationException e){Revoke(e.Message);}
         catch(TaskCanceledException){syncBlocked=true;if(authorization!=AuthorizationStatus.SetupRequired){authorization=AuthorizationStatus.Offline;warning.Text="Connecting to Workstream is taking longer than usual. Retrying automatically.";}}
         catch(HttpRequestException e) when(e.StatusCode is not null){syncBlocked=true;if(authorization!=AuthorizationStatus.SetupRequired){authorization=AuthorizationStatus.Authorized;warning.Text="Connected · sync retrying. "+e.Message;}}
@@ -194,10 +209,14 @@ internal sealed class AgentForm:Form {
         browserPair.Enabled=canOperate;correction.Enabled=canOperate&&state.SessionId==null;status.ForeColor=authorization==AuthorizationStatus.Offline?Color.FromArgb(158,97,29):Color.FromArgb(54,105,86);
         name.Text=setup?"Connect this computer":authorization==AuthorizationStatus.Connecting?"Checking device authorization…":state.EmployeeName;
         status.Text=setup?"Device not connected":authorization==AuthorizationStatus.Authorized?"Connected":authorization==AuthorizationStatus.Offline?"Offline · retrying":"Connecting";
-        url.Visible=code.Visible=pair.Visible=setup;sessionCard.Visible=canOperate;toggle.Visible=browserPair.Visible=correction.Visible=!setup;toggle.Enabled=canOperate&&(state.SessionId!=null||!syncBlocked);toggle.Text=state.SessionId==null?"START TIMER":"STOP TIMER";noticeCard.Visible=!string.IsNullOrWhiteSpace(warning.Text);
+        url.Visible=code.Visible=pair.Visible=setup;sessionCard.Visible=canOperate;toggle.Visible=browserPair.Visible=correction.Visible=logCard.Visible=!setup;toggle.Enabled=canOperate&&(state.SessionId!=null||!syncBlocked);toggle.Text=state.SessionId==null?"START TIMER":"STOP TIMER";if(string.IsNullOrWhiteSpace(warning.Text)&&!string.IsNullOrWhiteSpace(state.LastTimerNotice))warning.Text=state.LastTimerNotice;noticeCard.Visible=!string.IsNullOrWhiteSpace(warning.Text);logText.Text=store.RecentLogs();
         var elapsed=state.SessionId==null?0:Math.Max(0,Now-state.StartedAt);var idle=state.IdleMilliseconds+(state.IdleId==null?0:Now-state.IdleStartedAt);timerLabel.Text="CURRENT SESSION\n"+TimeSpan.FromMilliseconds(elapsed).ToString(@"hh\:mm\:ss")+"\nEffective  "+TimeSpan.FromMilliseconds(Math.Max(0,elapsed-idle)).ToString(@"hh\:mm\:ss");monitoring.Text=state.SessionId!=null&&state.MonitoringMode=="ACTIVE_MONITORING"&&canOperate?"Activity monitoring is on. Screenshot capture is temporarily unavailable.":"Monitoring is off";if(state.IdleId!=null&&canOperate)monitoring.Text+="\nYou are idle. Idle time is excluded from effective work.";
     }
     string BrowserDomain(string app)=>new[]{"chrome.exe","msedge.exe","brave.exe","opera.exe"}.Contains(app.ToLowerInvariant())?bridge.CurrentDomain:"";
+    void SessionChanged(object sender,SessionSwitchEventArgs e){if(IsDisposed||!IsHandleCreated)return;BeginInvoke(new Action(()=>{if(e.Reason==SessionSwitchReason.SessionLock)BeginSystemInactivity("Windows locked");else if(e.Reason==SessionSwitchReason.SessionUnlock)EndSystemInactivity();}));}
+    void PowerChanged(object sender,PowerModeChangedEventArgs e){if(IsDisposed||!IsHandleCreated)return;BeginInvoke(new Action(()=>{if(e.Mode==PowerModes.Suspend)BeginSystemInactivity("Computer sleeping");else if(e.Mode==PowerModes.Resume)EndSystemInactivity();}));}
+    void BeginSystemInactivity(string reason){if(state.SessionId==null)return;store.Atomic(()=>{if(state.SystemIdleStartedAt==0)state.SystemIdleStartedAt=Now;EnsureIdle(state.SystemIdleStartedAt);store.Save(state);});Render();}
+    void EndSystemInactivity(){if(state.SystemIdleStartedAt==0)return;store.Atomic(()=>{state.SystemIdleStartedAt=0;if(state.SessionId!=null&&state.IdleId!=null)CloseIdle(Now);store.Save(state);});Render();}
     void RequestCorrection(){
         using var dialog=new Form(){Text="Request time correction",ClientSize=new Size(400,350),StartPosition=FormStartPosition.CenterParent};
         var panel=new FlowLayoutPanel(){Dock=DockStyle.Fill,FlowDirection=FlowDirection.TopDown,Padding=new Padding(16),WrapContents=false};
@@ -213,6 +232,9 @@ internal sealed class AgentForm:Form {
     [DllImport("user32.dll")]static extern bool GetLastInputInfo(ref LastInput input);
     [DllImport("user32.dll")]static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")]static extern uint GetWindowThreadProcessId(IntPtr hwnd,out uint pid);
+    [DllImport("user32.dll",SetLastError=true)]static extern bool SystemParametersInfo(uint action,uint parameter,out bool value,uint flags);
+    const uint SpiGetScreenSaverRunning=114;
     static long IdleMilliseconds(){var input=new LastInput{cbSize=(uint)Marshal.SizeOf<LastInput>()};return GetLastInputInfo(ref input)?unchecked((uint)Environment.TickCount-input.dwTime):0;}
+    static bool ScreenSaverRunning(){try{return SystemParametersInfo(SpiGetScreenSaverRunning,0,out var running,0)&&running;}catch{return false;}}
     static string Foreground(){try{GetWindowThreadProcessId(GetForegroundWindow(),out var pid);using var process=Process.GetProcessById((int)pid);return process.ProcessName+".exe";}catch{return "unknown";}}
 }
