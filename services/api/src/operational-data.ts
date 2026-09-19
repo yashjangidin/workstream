@@ -42,8 +42,7 @@ export async function operationalData(companyId: string, date?: string) {
   const company = (await db.collection("companies").doc(companyId).get()).data()!;
   const timezone = company.timezone || "UTC", now = Date.now(), selected = date || localDate(now,timezone);
   const {start,end} = dayBounds(selected,timezone);
-  const [employees,sessions,idle,devices,activity,alerts,adjustments] = await Promise.all(["employees","work_sessions","idle_intervals","devices","activity_events","alerts","time_adjustments"].map(c => companyRecords(c,companyId)));
-  const employerAlerts=alerts.filter(alert=>alert.recipient!=="EMPLOYEE");
+  const [employees,sessions,idle,devices,activity,adjustments] = await Promise.all(["employees","work_sessions","idle_intervals","devices","activity_events","time_adjustments"].map(c => companyRecords(c,companyId)));
   const staleClosures=await reconcileStaleSessions(companyId,sessions,devices,now);
   const reportingSessions=sessions.map(session=>staleClosures.has(session.id)?{...session,status:"COMPLETED",stoppedAt:staleClosures.get(session.id)!}:session);
   const rows = employees.filter(e=>e.status !== "DELETED").map(employee => {
@@ -68,10 +67,9 @@ export async function operationalData(companyId: string, date?: string) {
     const firstStart=ownSessions.filter(session=>milliseconds(session.startedAt)>=start&&milliseconds(session.startedAt)<end).map(session=>milliseconds(session.startedAt)).sort((a,b)=>a-b)[0];
     const firstParts=firstStart?new Intl.DateTimeFormat("en-GB",{timeZone:timezone,hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).format(firstStart).split(":").map(Number):null,office=employee.officeStart?String(employee.officeStart).split(":").map(Number):null;
     const lateStart=Boolean(firstParts&&office&&firstParts[0]*60+firstParts[1]>office[0]*60+office[1]+Number(employee.lateStartDelaySeconds??0)/60);
-    return { ...employee, ...time, ...operationalStatus(device as {status:string;lastHeartbeatAt?:unknown},!!active,!!activeIdle,now,config.OFFLINE_TIMEOUT), device:deviceSummary, activeSessionStartedAt:active?.startedAt??null, activeIdleStartedAt:activeIdle?.startedAt??null, requiredSeconds, remainingSeconds:Math.max(0,requiredSeconds-time.effectiveSeconds), targetStatus:targetStatus(time.timerSeconds,time.effectiveSeconds,requiredSeconds,end,now), productivity, sessionCount, lateStart, alertCount:employerAlerts.filter(a=>a.employeeId===employee.id&&milliseconds(a.createdAt)>=start&&milliseconds(a.createdAt)<end).length };
+    return { ...employee, ...time, ...operationalStatus(device as {status:string;lastHeartbeatAt?:unknown},!!active,!!activeIdle,now,config.OFFLINE_TIMEOUT), device:deviceSummary, activeSessionStartedAt:active?.startedAt??null, activeIdleStartedAt:activeIdle?.startedAt??null, requiredSeconds, remainingSeconds:Math.max(0,requiredSeconds-time.effectiveSeconds), targetStatus:targetStatus(time.timerSeconds,time.effectiveSeconds,requiredSeconds,end,now), productivity, sessionCount, lateStart, alertCount:0 };
   });
-  const todayAlerts = employerAlerts.filter(a=>milliseconds(a.createdAt)>=start&&milliseconds(a.createdAt)<end);
   return { company:{id:companyId,name:company.name,timezone}, date:selected, generatedAt:now, employees:rows,
-    totals:{employees:rows.length, working:rows.filter(r=>r.workStatus==="WORKING").length,idle:rows.filter(r=>r.workStatus==="IDLE").length,notWorking:rows.filter(r=>r.workStatus==="NOT_WORKING").length,offline:rows.filter(r=>r.deviceStatus==="OFFLINE").length,belowTarget:rows.filter(r=>r.targetStatus!=="COMPLETED").length,alerts:todayAlerts.length,timerSeconds:rows.reduce((s,r)=>s+r.timerSeconds,0),idleSeconds:rows.reduce((s,r)=>s+r.idleSeconds,0),effectiveSeconds:rows.reduce((s,r)=>s+r.effectiveSeconds,0)},
-    alerts:todayAlerts.sort((a,b)=>milliseconds(b.createdAt)-milliseconds(a.createdAt)).slice(0,8) };
+    totals:{employees:rows.length, working:rows.filter(r=>r.workStatus==="WORKING").length,idle:rows.filter(r=>r.workStatus==="IDLE").length,notWorking:rows.filter(r=>r.workStatus==="NOT_WORKING").length,offline:rows.filter(r=>r.deviceStatus==="OFFLINE").length,belowTarget:rows.filter(r=>r.targetStatus!=="COMPLETED").length,alerts:0,timerSeconds:rows.reduce((s,r)=>s+r.timerSeconds,0),idleSeconds:rows.reduce((s,r)=>s+r.idleSeconds,0),effectiveSeconds:rows.reduce((s,r)=>s+r.effectiveSeconds,0)},
+    alerts:[] };
 }

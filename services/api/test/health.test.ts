@@ -18,7 +18,7 @@ test("browser preflight permits notification channel updates", async () => {
   const app = await buildApp();
   const response = await app.inject({
     method: "OPTIONS",
-    url: "/v1/notification-channels/DASHBOARD",
+    url: "/v1/notification-channels/EMAIL",
     headers: {
       origin: "http://localhost:5173",
       "access-control-request-method": "PUT",

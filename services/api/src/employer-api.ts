@@ -2,32 +2,30 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db, storage } from "./firebase.js";
 import { requireEmployer } from "./security.js";
-import { id, dateInput, schedule, timezone, ruleInput, defaultEmployerAlerts, defaultEmployeeAlerts, normaliseAlerts, employeeAlertTypes, employerAlertTypes, sanitiseAlertSettings } from "./schemas.js";
+import { id, dateInput, schedule, timezone, ruleInput, defaultEmployerAlerts, defaultEmployeeAlerts, normaliseAlerts, employeeReportTypes, employerReportTypes, sanitiseAlertSettings } from "./schemas.js";
 import { owned, clean, companyRecords, fail } from "./repository.js";
 import { operationalData } from "./operational-data.js";
 import { dayBounds, nextDate, localDate, milliseconds } from "@workstream/domain";
 
-import {channelConfigured,encryptedNotificationsConfigured} from "./notifications.js";
-import {channelMetadata,channelType,removeChannel,saveChannel,testTelegram} from "./notification-channels.js";
+import {channelMetadata,channelType,removeChannel,saveChannel} from "./notification-channels.js";
 const defaults={timezone:"UTC",requiredDailySeconds:28800,workdays:[1,2,3,4,5],idleThresholdSeconds:30,monitoringMode:"SIMPLE_TIMER",lateStartDelaySeconds:3600};
 export async function employerRoutes(app:FastifyInstance) {
   app.get("/v1/settings",async request=>{
     const a=await requireEmployer(request),company=await db.collection("companies").doc(a.companyId).get();
     const settings=await company.ref.collection("settings").get();
-    return clean({company:{name:company.data()?.name,timezone:company.data()?.timezone},defaults:{...defaults,...settings.docs.find(d=>d.id==="defaults")?.data()},employerAlerts:normaliseAlerts(settings.docs.find(d=>d.id==="employerAlerts")?.data(),defaultEmployerAlerts,employerAlertTypes),employeeAlerts:normaliseAlerts(settings.docs.find(d=>d.id==="employeeAlerts")?.data(),defaultEmployeeAlerts,employeeAlertTypes),channels:await channelMetadata(a.companyId)});
+    return clean({company:{name:company.data()?.name,timezone:company.data()?.timezone},defaults:{...defaults,...settings.docs.find(d=>d.id==="defaults")?.data()},employerAlerts:normaliseAlerts(settings.docs.find(d=>d.id==="employerAlerts")?.data(),defaultEmployerAlerts,employerReportTypes),employeeAlerts:normaliseAlerts(settings.docs.find(d=>d.id==="employeeAlerts")?.data(),defaultEmployeeAlerts,employeeReportTypes),channels:await channelMetadata(a.companyId)});
   });
   app.get("/v1/notification-channels",async request=>clean(await channelMetadata((await requireEmployer(request)).companyId)));
   app.put("/v1/notification-channels/:type",async request=>{
-    const a=await requireEmployer(request),type=channelType.parse((request.params as {type:string}).type),body=z.object({enabled:z.boolean(),destination:z.string().max(254).optional(),token:z.string().min(8).max(512).optional(),provider:z.string().max(80).optional()}).parse(request.body);
+    const a=await requireEmployer(request),type=channelType.parse((request.params as {type:string}).type),body=z.object({enabled:z.boolean(),destination:z.string().email().max(254).optional()}).parse(request.body);
     await saveChannel(a.companyId,type,body);await db.collection("audit_logs").add({companyId:a.companyId,actorUserId:a.uid,action:"NOTIFICATION_CHANNEL_SAVED",targetId:type,createdAt:Date.now()});return clean((await channelMetadata(a.companyId)).find(channel=>channel.type===type));
   });
   app.delete("/v1/notification-channels/:type",async request=>{const a=await requireEmployer(request),type=channelType.parse((request.params as {type:string}).type);await removeChannel(a.companyId,type);await db.collection("audit_logs").add({companyId:a.companyId,actorUserId:a.uid,action:"NOTIFICATION_CHANNEL_REMOVED",targetId:type,createdAt:Date.now()});return {removed:true};});
-  app.post("/v1/notification-channels/TELEGRAM/test",async request=>{const a=await requireEmployer(request),body=z.object({token:z.string().min(8).max(512).optional(),chatId:z.string().min(1).max(128).optional()}).parse(request.body);return testTelegram(a.companyId,body);});
   app.patch("/v1/settings/:section",async request=>{
     const a=await requireEmployer(request),section=z.enum(["company","defaults","employerAlerts","employeeAlerts"]).parse((request.params as {section:string}).section);
     const value=section==="company"?z.object({name:z.string().trim().min(2).max(120),timezone}).parse(request.body):section==="defaults"?schedule.parse(request.body):sanitiseAlertSettings(request.body,section==="employeeAlerts"?"EMPLOYEE":"EMPLOYER");
     const company=db.collection("companies").doc(a.companyId),ref=section==="company"?company:company.collection("settings").doc(section);
-    await db.runTransaction(async tx=>{const before=await tx.get(ref);const employees=section==="defaults"?await tx.get(db.collection("employees").where("companyId","==",a.companyId).where("status","==","ACTIVE")):null;let stored=value as Record<string,unknown>;if(section==="employerAlerts"||section==="employeeAlerts"){const supported=new Set<string>(section==="employeeAlerts"?employeeAlertTypes:employerAlertTypes),legacy=Object.fromEntries(Object.entries(before.data()??{}).filter(([type])=>!supported.has(type)).map(([type,rule])=>[type,{...(rule as Record<string,unknown>),enabled:false,activationVersion:3}]));stored={...legacy,...value};}tx.set(ref,stored,{merge:section==="company"});if(employees){const shared=value as {workdays:number[];idleThresholdSeconds:number;officeStart?:string;officeEnd?:string;lateStartDelaySeconds:number};for(const employee of employees.docs)tx.update(employee.ref,{workdays:shared.workdays,idleThresholdSeconds:shared.idleThresholdSeconds,officeStart:shared.officeStart??null,officeEnd:shared.officeEnd??null,lateStartDelaySeconds:shared.lateStartDelaySeconds,updatedAt:Date.now()});}tx.create(db.collection("audit_logs").doc(),{companyId:a.companyId,actorUserId:a.uid,action:"SETTINGS_UPDATED",targetId:section,oldValue:clean(before.data()),newValue:stored,createdAt:Date.now()});});
+    await db.runTransaction(async tx=>{const before=await tx.get(ref);const employees=section==="defaults"?await tx.get(db.collection("employees").where("companyId","==",a.companyId).where("status","==","ACTIVE")):null;let stored=value as Record<string,unknown>;if(section==="employerAlerts"||section==="employeeAlerts"){const supported=new Set<string>(section==="employeeAlerts"?employeeReportTypes:employerReportTypes),legacy=Object.fromEntries(Object.entries(before.data()??{}).filter(([type])=>!supported.has(type)).map(([type,rule])=>[type,{...(rule as Record<string,unknown>),enabled:false,activationVersion:3}]));stored={...legacy,...value};}tx.set(ref,stored,{merge:section==="company"});if(employees){const shared=value as {workdays:number[];idleThresholdSeconds:number;officeStart?:string;officeEnd?:string;lateStartDelaySeconds:number};for(const employee of employees.docs)tx.update(employee.ref,{workdays:shared.workdays,idleThresholdSeconds:shared.idleThresholdSeconds,officeStart:shared.officeStart??null,officeEnd:shared.officeEnd??null,lateStartDelaySeconds:shared.lateStartDelaySeconds,updatedAt:Date.now()});}tx.create(db.collection("audit_logs").doc(),{companyId:a.companyId,actorUserId:a.uid,action:"SETTINGS_UPDATED",targetId:section,oldValue:clean(before.data()),newValue:stored,createdAt:Date.now()});});
     return {saved:true};
   });
   app.get("/v1/rules",async request=>{const a=await requireEmployer(request);return clean({rules:await companyRecords("monitoring_rules",a.companyId)});});
@@ -47,16 +45,6 @@ export async function employerRoutes(app:FastifyInstance) {
     const a=await requireEmployer(request),record=await owned("devices",id.parse((request.params as {id:string}).id),a.companyId);const batch=db.batch();
     batch.update(record.ref,{status:"REVOKED",revokedAt:Date.now()});batch.create(db.collection("audit_logs").doc(),{companyId:a.companyId,actorUserId:a.uid,action:"DEVICE_REVOKED",targetId:record.id,createdAt:Date.now()});await batch.commit();return {revoked:true};
   });
-  app.get("/v1/alerts",async request=>{
-    const a=await requireEmployer(request),q=z.object({date:dateInput.optional(),employeeId:id.optional(),state:z.enum(["all","unread","acknowledged"]).default("all"),type:z.string().optional(),page:z.coerce.number().int().min(1).default(1)}).parse(request.query);
-    const company=(await db.collection("companies").doc(a.companyId).get()).data()!,bounds=q.date?dayBounds(q.date,company.timezone):null;
-    const rows=(await companyRecords("alerts",a.companyId)).filter(r=>r.recipient!=="EMPLOYEE"&&(!bounds||(milliseconds(r.createdAt)>=bounds.start&&milliseconds(r.createdAt)<bounds.end))&&(!q.employeeId||r.employeeId===q.employeeId)&&(!q.type||r.type===q.type)&&(q.state==="all"||(q.state==="acknowledged"?!!r.acknowledgedAt:!r.acknowledgedAt))).sort((a,b)=>milliseconds(b.createdAt)-milliseconds(a.createdAt));
-    return clean({alerts:rows.slice((q.page-1)*25,q.page*25),total:rows.length});
-  });
-  app.post("/v1/alerts/:id/acknowledge",async request=>{
-    const a=await requireEmployer(request),record=await owned("alerts",id.parse((request.params as {id:string}).id),a.companyId);
-    await record.ref.update({acknowledgedAt:Date.now(),acknowledgedBy:a.uid});return {acknowledged:true};
-  });
   app.get("/v1/reports",async request=>{
     const a=await requireEmployer(request),q=z.object({date:dateInput,period:z.enum(["daily","weekly"]).default("daily"),employeeId:id.optional()}).parse(request.query);
     const days=[];for(let i=0;i<(q.period==="weekly"?7:1);i++)days.push(await operationalData(a.companyId,nextDate(q.date,i)));
@@ -65,11 +53,11 @@ export async function employerRoutes(app:FastifyInstance) {
     return clean({rows:q.period==="weekly"?weekly:rows,dailyRows:rows,period:q.period,date:q.date,timezone:days[0].company.timezone});
   });
   app.get("/v1/employees/:id/records",async request=>{
-    const a=await requireEmployer(request),employeeId=id.parse((request.params as {id:string}).id),q=z.object({date:dateInput,page:z.coerce.number().int().min(1).default(1),kind:z.enum(["sessions","idle","activity","screenshots","devices","alerts","timeline"])}).parse(request.query);
+    const a=await requireEmployer(request),employeeId=id.parse((request.params as {id:string}).id),q=z.object({date:dateInput,page:z.coerce.number().int().min(1).default(1),kind:z.enum(["sessions","idle","activity","screenshots","devices","timeline"])}).parse(request.query);
     await owned("employees",employeeId,a.companyId);
     const company=(await db.collection("companies").doc(a.companyId).get()).data()!,bounds=dayBounds(q.date,company.timezone);
-    const collections=q.kind==="timeline"?["work_sessions","idle_intervals","activity_events","screenshots","alerts","devices"]:[{sessions:"work_sessions",idle:"idle_intervals",activity:"activity_events",screenshots:"screenshots",devices:"devices",alerts:"alerts"}[q.kind]];
-    const rows=(await Promise.all(collections.map(async c=>(await companyRecords(c,a.companyId)).filter(r=>r.employeeId===employeeId&&(c!=="alerts"||r.recipient!=="EMPLOYEE")).map(r=>({...r,kind:c}))))).flat().filter(r=>{if(q.kind==="devices")return r.status!=="REVOKED";const t=milliseconds(r.startedAt??r.timestamp??r.createdAt);return t<bounds.end&&(!r.stoppedAt&&!r.endedAt&&r.status==="ACTIVE"||milliseconds(r.stoppedAt??r.endedAt??t)>=bounds.start);}).sort((a,b)=>milliseconds(b.lastHeartbeatAt??b.startedAt??b.timestamp??b.createdAt)-milliseconds(a.lastHeartbeatAt??a.startedAt??a.timestamp??a.createdAt));
+    const collections=q.kind==="timeline"?["work_sessions","idle_intervals","activity_events","screenshots","devices"]:[{sessions:"work_sessions",idle:"idle_intervals",activity:"activity_events",screenshots:"screenshots",devices:"devices"}[q.kind]];
+    const rows=(await Promise.all(collections.map(async c=>(await companyRecords(c,a.companyId)).filter(r=>r.employeeId===employeeId).map(r=>({...r,kind:c}))))).flat().filter(r=>{if(q.kind==="devices")return r.status!=="REVOKED";const t=milliseconds(r.startedAt??r.timestamp??r.createdAt);return t<bounds.end&&(!r.stoppedAt&&!r.endedAt&&r.status==="ACTIVE"||milliseconds(r.stoppedAt??r.endedAt??t)>=bounds.start);}).sort((a,b)=>milliseconds(b.lastHeartbeatAt??b.startedAt??b.timestamp??b.createdAt)-milliseconds(a.lastHeartbeatAt??a.startedAt??a.timestamp??a.createdAt));
     const visible=q.kind==="devices"?rows.slice(0,1):rows;
     return clean({records:visible.slice((q.page-1)*25,q.page*25),total:visible.length});
   });

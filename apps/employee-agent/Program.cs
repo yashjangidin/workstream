@@ -63,7 +63,7 @@ internal sealed class Store : IDisposable {
     public void Dispose()=>connection.Dispose();
 }
 internal sealed class AgentForm:Form {
-    const string AgentVersion="0.2.9";
+    const string AgentVersion="0.2.10";
     const bool ScreenshotUploadsEnabled=false;
     readonly BrowserBridge bridge=new();
     readonly Button browserPair=new(){Text="Copy browser pairing key",Width=320},correction=new(){Text="Request time correction",Width=320};
@@ -77,7 +77,7 @@ internal sealed class AgentForm:Form {
     readonly NotifyIcon trayIcon=new();
     Icon? appIcon;
     long SyncIntervalMilliseconds=>Math.Max(30,state.HeartbeatSeconds)*1000L;
-    bool syncing=false,closing=false,closed=false; AuthorizationStatus authorization; int rejected=0;long lastSync=0,lastCapture=0,activityAt=0;string application="",activeDomain="";
+    bool syncing=false,closing=false,closed=false,syncBlocked=false; AuthorizationStatus authorization; int rejected=0;long lastSync=0,lastCapture=0,activityAt=0;string application="",activeDomain="";
     static long Now=>DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     public AgentForm(){
         state=store.Load();
@@ -137,7 +137,7 @@ internal sealed class AgentForm:Form {
             using var payload=JsonDocument.Parse(string.IsNullOrWhiteSpace(text)?"{}":text);var code=payload.RootElement.TryGetProperty("code",out var value)?value.GetString():null;var message=payload.RootElement.TryGetProperty("message",out var detail)?detail.GetString():null;
             if(!string.IsNullOrWhiteSpace(code))throw new DeviceAuthorizationException(code!,message??"This device is no longer authorized.");
         }
-        if(!response.IsSuccessStatusCode)throw new HttpRequestException("Sync failed ("+(int)response.StatusCode+"). Data is retained for retry.",null,response.StatusCode);
+        if(!response.IsSuccessStatusCode){string? detail=null;try{using var payload=JsonDocument.Parse(string.IsNullOrWhiteSpace(text)?"{}":text);if(payload.RootElement.TryGetProperty("message",out var message))detail=message.GetString();}catch(JsonException){}throw new HttpRequestException((detail??"The server rejected a synchronization request.")+" Data is retained for retry.",null,response.StatusCode);}
         return JsonDocument.Parse(text).RootElement.Clone();
     }
     bool CanOperate()=>AuthorizationGate.CanOperate(authorization,state.DeviceId,state.LastAuthorizedAt,Now)&&!closing;
@@ -146,7 +146,7 @@ internal sealed class AgentForm:Form {
     async Task RevalidateAuthorization(){if(state.DeviceId==""||state.Credential=="")return;authorization=AuthorizationStatus.Connecting;Render();await Sync();}
     async Task Toggle(){
         if(!CanOperate()){warning.Text=authorization==AuthorizationStatus.Offline?"Workstream is offline. Reconnecting before a new timer can start.":"Connect this computer to an employee before starting a timer.";Render();return;}
-        if(state.SessionId==null){await Sync();if(!CanOperate())return;}
+        if(state.SessionId==null){await Sync();if(!CanOperate()||syncBlocked)return;}
         store.Atomic(()=>{
             if(state.SessionId==null){
                 state.SessionId=Guid.NewGuid().ToString("N");state.StartedAt=Now;state.TimerStateChangedAt=state.StartedAt;state.IdleMilliseconds=0;
@@ -168,12 +168,11 @@ internal sealed class AgentForm:Form {
     }
     void CaptureScreenshot(){try{if(!CanOperate()||state.SessionId==null||state.MonitoringMode!="ACTIVE_MONITORING")return;var size=Directory.EnumerateFiles(store.DirectoryPath,"*.capture").Sum(p=>new FileInfo(p).Length);if(size>250L*1024*1024){warning.Text="Screenshot queue is full. Unsent images are retained; capture resumes after sync and cleanup.";return;}var bounds=Screen.PrimaryScreen!.Bounds;using var bitmap=new Bitmap(bounds.Width,bounds.Height);using(var graphics=Graphics.FromImage(bitmap))graphics.CopyFromScreen(bounds.Location,Point.Empty,bounds.Size);var path=Path.Combine(store.DirectoryPath,Guid.NewGuid().ToString("N")+".capture");var codec=ImageCodecInfo.GetImageEncoders().First(c=>c.MimeType=="image/jpeg");using var parameters=new EncoderParameters(1);parameters.Param[0]=new EncoderParameter(System.Drawing.Imaging.Encoder.Quality,55L);using var stream=new MemoryStream();bitmap.Save(stream,codec,parameters);File.WriteAllBytes(path,ProtectedData.Protect(stream.ToArray(),null,DataProtectionScope.CurrentUser));store.Add("/v1/device/screenshots",new{operationId=Guid.NewGuid().ToString("N"),sessionId=state.SessionId,at=Now,application,domain=BrowserDomain(application)},path);}catch{warning.Text="Screenshot capture failed. Timer continues.";}}
     async Task Sync(){
-        if(syncing)return; syncing=true;
+        if(syncing)return; syncing=true;syncBlocked=false;
         try{
-            await Send("/v1/device/heartbeat",HttpMethod.Post,JsonSerializer.Serialize(new{agentVersion=AgentVersion,timerState=state.SessionId==null?"STOPPED":"RUNNING",timerStateAt=state.TimerStateChangedAt>0?state.TimerStateChangedAt:Now}));
+            await Send("/v1/device/heartbeat",HttpMethod.Post,JsonSerializer.Serialize(new{agentVersion=AgentVersion,timerState=state.SessionId==null?"STOPPED":"RUNNING",sessionId=state.SessionId,timerStateAt=state.TimerStateChangedAt>0?state.TimerStateChangedAt:Now}));
             var conf=await Send("/v1/device/config",HttpMethod.Get);const string mode="SIMPLE_TIMER";
             if(mode!=state.MonitoringMode){activityAt=Now;lastCapture=Now;}state.MonitoringMode=mode;state.EmployeeName=conf.GetProperty("employeeName").GetString()!;state.IdleThresholdSeconds=conf.GetProperty("idleThresholdSeconds").GetInt32();state.RequiredDailySeconds=conf.GetProperty("requiredDailySeconds").GetInt32();state.HeartbeatSeconds=conf.GetProperty("heartbeatSeconds").GetInt32();state.Timezone=conf.GetProperty("timezone").GetString()!;state.LastAuthorizedAt=Now;authorization=AuthorizationStatus.Authorized;store.Save(state);
-            if(conf.TryGetProperty("notifications",out var notifications))foreach(var notification in notifications.EnumerateArray()){var id=notification.GetProperty("id").GetString();var title=notification.GetProperty("title").GetString()??"Workstream";var message=notification.GetProperty("message").GetString()??"";if(string.IsNullOrWhiteSpace(id)||string.IsNullOrWhiteSpace(message))continue;trayIcon.ShowBalloonTip(8000,title,message,ToolTipIcon.Info);try{await Send("/v1/device/notifications/"+id+"/acknowledge",HttpMethod.Post,"{}");}catch{/* Retry on the next successful sync. */}}
             var monitoringRetry=false;
             for(var count=0;count<50;count++){
                 var item=store.First();if(item==null)break;var body=item.Value.Body;
@@ -184,17 +183,18 @@ internal sealed class AgentForm:Form {
             }
             store.Cleanup();warning.Text=monitoringRetry?"Screenshot delivery is retrying. Your timer and work-time data are synced.":rejected>0?$"{rejected} monitoring record(s) were rejected by server policy. Timer sync continues.":"";
         }catch(DeviceAuthorizationException e){Revoke(e.Message);}
-        catch(TaskCanceledException){if(authorization!=AuthorizationStatus.SetupRequired){authorization=AuthorizationStatus.Offline;warning.Text="Connecting to Workstream is taking longer than usual. Retrying automatically.";}}
-        catch(Exception e){if(authorization!=AuthorizationStatus.SetupRequired){authorization=AuthorizationStatus.Offline;warning.Text="Offline · retrying. "+e.Message;}}
+        catch(TaskCanceledException){syncBlocked=true;if(authorization!=AuthorizationStatus.SetupRequired){authorization=AuthorizationStatus.Offline;warning.Text="Connecting to Workstream is taking longer than usual. Retrying automatically.";}}
+        catch(HttpRequestException e) when(e.StatusCode is not null){syncBlocked=true;if(authorization!=AuthorizationStatus.SetupRequired){authorization=AuthorizationStatus.Authorized;warning.Text="Connected · sync retrying. "+e.Message;}}
+        catch(Exception e){syncBlocked=true;if(authorization!=AuthorizationStatus.SetupRequired){authorization=AuthorizationStatus.Offline;warning.Text="Offline · retrying. "+e.Message;}}
         finally{syncing=false;Render();}
     }
     void Render(){
         var canOperate=CanOperate();var setup=authorization==AuthorizationStatus.SetupRequired||authorization==AuthorizationStatus.Revoked;
         bridge.Enabled=canOperate&&state.SessionId!=null&&state.MonitoringMode=="ACTIVE_MONITORING";
-        browserPair.Enabled=canOperate;correction.Enabled=canOperate;status.ForeColor=authorization==AuthorizationStatus.Offline?Color.FromArgb(158,97,29):Color.FromArgb(54,105,86);
+        browserPair.Enabled=canOperate;correction.Enabled=canOperate&&state.SessionId==null;status.ForeColor=authorization==AuthorizationStatus.Offline?Color.FromArgb(158,97,29):Color.FromArgb(54,105,86);
         name.Text=setup?"Connect this computer":authorization==AuthorizationStatus.Connecting?"Checking device authorization…":state.EmployeeName;
         status.Text=setup?"Device not connected":authorization==AuthorizationStatus.Authorized?"Connected":authorization==AuthorizationStatus.Offline?"Offline · retrying":"Connecting";
-        url.Visible=code.Visible=pair.Visible=setup;sessionCard.Visible=canOperate;toggle.Visible=browserPair.Visible=correction.Visible=!setup;toggle.Enabled=canOperate;toggle.Text=state.SessionId==null?"START TIMER":"STOP TIMER";noticeCard.Visible=!string.IsNullOrWhiteSpace(warning.Text);
+        url.Visible=code.Visible=pair.Visible=setup;sessionCard.Visible=canOperate;toggle.Visible=browserPair.Visible=correction.Visible=!setup;toggle.Enabled=canOperate&&(state.SessionId!=null||!syncBlocked);toggle.Text=state.SessionId==null?"START TIMER":"STOP TIMER";noticeCard.Visible=!string.IsNullOrWhiteSpace(warning.Text);
         var elapsed=state.SessionId==null?0:Math.Max(0,Now-state.StartedAt);var idle=state.IdleMilliseconds+(state.IdleId==null?0:Now-state.IdleStartedAt);timerLabel.Text="CURRENT SESSION\n"+TimeSpan.FromMilliseconds(elapsed).ToString(@"hh\:mm\:ss")+"\nEffective  "+TimeSpan.FromMilliseconds(Math.Max(0,elapsed-idle)).ToString(@"hh\:mm\:ss");monitoring.Text=state.SessionId!=null&&state.MonitoringMode=="ACTIVE_MONITORING"&&canOperate?"Activity monitoring is on. Screenshot capture is temporarily unavailable.":"Monitoring is off";if(state.IdleId!=null&&canOperate)monitoring.Text+="\nYou are idle. Idle time is excluded from effective work.";
     }
     string BrowserDomain(string app)=>new[]{"chrome.exe","msedge.exe","brave.exe","opera.exe"}.Contains(app.ToLowerInvariant())?bridge.CurrentDomain:"";

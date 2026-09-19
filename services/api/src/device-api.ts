@@ -53,25 +53,19 @@ export async function deviceRoutes(app:FastifyInstance) {
   });
   app.get("/v1/device/config",async request=>{
     const d=await requireDevice(request);
-    const pending=(await db.collection("notification_jobs").where("employeeId","==",d.employeeId).get()).docs.map(doc=>({id:doc.id,...doc.data()} as {id:string;companyId:string;channel:string;status:string;createdAt:number;title:string;message:string})).filter(notification=>notification.companyId===d.companyId&&notification.channel==="WINDOWS_AGENT"&&notification.status==="PENDING").sort((a,b)=>Number(a.createdAt)-Number(b.createdAt)).slice(0,1).map(({id,title,message})=>({id,title,message}));
-    return {employeeName:d.employee.fullName,timezone:d.employee.timezone,requiredDailySeconds:d.employee.requiredDailySeconds,idleThresholdSeconds:d.employee.idleThresholdSeconds,monitoringMode:"SIMPLE_TIMER",heartbeatSeconds:config.HEARTBEAT_INTERVAL,screenshotSeconds:0,notifications:pending};
-  });
-  app.post("/v1/device/notifications/:id/acknowledge",async request=>{
-    const d=await requireDevice(request),notificationId=id.parse((request.params as {id:string}).id),ref=db.collection("notification_jobs").doc(notificationId),notification=(await ref.get()).data();
-    if(!notification||notification.channel!=="WINDOWS_AGENT"||notification.companyId!==d.companyId||notification.employeeId!==d.employeeId)fail(404,"Notification not found.");
-    if(notification.status==="PENDING")await ref.update({status:"DELIVERED",deliveredAt:Date.now(),deviceId:d.deviceId});
-    return {acknowledged:true};
+    return {employeeName:d.employee.fullName,timezone:d.employee.timezone,requiredDailySeconds:d.employee.requiredDailySeconds,idleThresholdSeconds:d.employee.idleThresholdSeconds,monitoringMode:"SIMPLE_TIMER",heartbeatSeconds:config.HEARTBEAT_INTERVAL,screenshotSeconds:0};
   });
   app.post("/v1/device/heartbeat",async request=>{
     const d=await requireDevice(request);
-    const body=z.object({agentVersion:z.string().max(30),timerState:z.enum(["RUNNING","STOPPED"]),timerStateAt:z.number().int().positive().refine(v=>v<=Date.now()+60000,"Timestamp is in the future.").optional()}).parse(request.body);
+    const body=z.object({agentVersion:z.string().max(30),timerState:z.enum(["RUNNING","STOPPED"]),sessionId:id.nullable().optional(),timerStateAt:z.number().int().positive().refine(v=>v<=Date.now()+60000,"Timestamp is in the future.").optional()}).parse(request.body);
     const stopped=await db.runTransaction(async tx=>{
       const [doc,employee]=await Promise.all([tx.get(d.ref),tx.get(d.employeeRef)]);
       if(doc.data()?.status==="REVOKED")deviceFailure("DEVICE_REVOKED","This device has been revoked.");
       const now=Date.now();
       const activeSessionId=employee.data()?.activeSessionId;
       let sessionRef:any, session:any, idle:any;
-      if(body.timerState==="STOPPED"&&activeSessionId){
+      const sessionMismatch=body.timerState==="RUNNING"&&Boolean(body.sessionId)&&activeSessionId!==body.sessionId;
+      if(activeSessionId&&(body.timerState==="STOPPED"||sessionMismatch)){
         sessionRef=db.collection("work_sessions").doc(activeSessionId);
         [session,idle]=await Promise.all([tx.get(sessionRef),tx.get(db.collection("idle_intervals").where("sessionId","==",activeSessionId))]);
       }
@@ -80,11 +74,11 @@ export async function deviceRoutes(app:FastifyInstance) {
       tx.update(d.ref,{lastHeartbeatAt:now,lastSyncAt:now,agentVersion:body.agentVersion,timerState:body.timerState});
       const s=session?.data();
       if(!s||s.status!=="ACTIVE"||s.deviceId!==d.deviceId)return null;
-      const stoppedAt=Math.max(Number(s.startedAt),body.timerStateAt??now);
+      const stoppedAt=Math.max(Number(s.startedAt),Math.min(now,body.timerStateAt??now));
       const intervals=idle.docs.map((interval:any)=>{const value=interval.data();return {startedAt:new Date(value.startedAt),endedAt:new Date(value.endedAt??stoppedAt)};});
       const totals=calculateTimeTotals({startedAt:new Date(s.startedAt),endedAt:new Date(stoppedAt)},intervals);
       idle.docs.filter((interval:any)=>!interval.data().endedAt).forEach((interval:any)=>tx.update(interval.ref,{endedAt:stoppedAt}));
-      tx.update(sessionRef,{stoppedAt,status:"COMPLETED",...totals,updatedAt:now,closedBy:"STOPPED_HEARTBEAT"});
+      tx.update(sessionRef,{stoppedAt,status:"COMPLETED",...totals,updatedAt:now,closedBy:body.timerState==="STOPPED"?"STOPPED_HEARTBEAT":"SESSION_RECONCILIATION"});
       tx.update(d.employeeRef,{activeSessionId:null});
       return totals;
     });
@@ -116,13 +110,17 @@ export async function deviceRoutes(app:FastifyInstance) {
       if(device.data()?.status==="REVOKED")deviceFailure("DEVICE_REVOKED","This device has been revoked.");
       if(!s||s.deviceId!==d.deviceId)fail(404,"Session not found.");
       if(body.at<s.startedAt||(body.endedAt!==null&&(body.endedAt<body.at||body.endedAt>Date.now()+60000)))fail(400,"Invalid idle interval.");
-      if(s.stoppedAt && (!body.endedAt||body.endedAt>s.stoppedAt))fail(409,"Idle interval is outside the session.");
+      // A stale open-idle marker may arrive after the heartbeat has safely
+      // closed the session. The later closing marker contains the full interval.
+      if(s.stoppedAt&&body.endedAt===null)return false;
+      if(s.stoppedAt&&body.at>s.stoppedAt)return false;
       if(existing.exists&&existing.data()?.sessionId!==body.sessionId)fail(409,"Idle ID unavailable.");
       // Device requests are queued and retried. Only the first transition for
       // an interval changes the compact dashboard projection.
       if(existing.data()?.endedAt)return false;
       if(existing.exists&&body.endedAt===null)return false;
-      tx.set(ref,{companyId:d.companyId,employeeId:d.employeeId,deviceId:d.deviceId,sessionId:body.sessionId,startedAt:body.at,endedAt:body.endedAt});
+      const endedAt=s.stoppedAt&&body.endedAt?Math.min(body.endedAt,s.stoppedAt):body.endedAt;
+      tx.set(ref,{companyId:d.companyId,employeeId:d.employeeId,deviceId:d.deviceId,sessionId:body.sessionId,startedAt:body.at,endedAt});
       return true;
     });
     if(saved)await patchDashboardEmployee(d.companyId,d.employeeId,{workStatus:body.endedAt===null?"IDLE":"WORKING",activeIdleStartedAt:body.endedAt===null?body.at:null,liveIdleIntervals:{[body.idleId]:{startedAt:body.at,endedAt:body.endedAt}}});

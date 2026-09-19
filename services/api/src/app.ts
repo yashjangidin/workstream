@@ -9,7 +9,6 @@ import { ZodError } from "zod";
 import { screenshotRoutes } from "./screenshots.js";
 import {jobsRoutes} from "./jobs.js";
 import {correctionRoutes} from './corrections.js';
-import { alertJobRoutes } from "./alert-engine.js";
 
 export async function buildApp(logger=false){
 const app = Fastify({ logger });
@@ -32,7 +31,6 @@ await app.register(signupRoutes);
 await app.register(deviceRoutes);
 await app.register(employerRoutes);
 await app.register(screenshotRoutes);
-await app.register(alertJobRoutes);
 await app.register(jobsRoutes);
 await app.register(correctionRoutes);
 app.setErrorHandler((error, request, reply) => {

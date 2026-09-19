@@ -40,7 +40,7 @@ try{
   await edit.getByText('Saved successfully.',{exact:true}).waitFor();
   await edit.getByRole('button',{name:'Close',exact:true}).click();
   await page.reload();await page.getByRole('heading',{name:'Persisted QA Employee',exact:true}).waitFor();
-  for(const tab of ['Sessions','Idle','Productivity','Screenshots','Activity Timeline','Alerts','Device','Settings']){
+  for(const tab of ['Sessions','Idle','Productivity','Screenshots','Activity Timeline','Device','Settings']){
     await page.locator('.tabs').getByRole('button',{name:tab,exact:true}).click();
     await page.waitForTimeout(350);
   }
