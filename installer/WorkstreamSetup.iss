@@ -1,5 +1,7 @@
 #define MyAppName "Workstream"
-#define MyAppVersion "0.2.9"
+#ifndef MyAppVersion
+  #define MyAppVersion "0.2.10"
+#endif
 #define MyAppPublisher "Workstream"
 #ifndef AgentPublishDir
   #define AgentPublishDir "..\\apps\\employee-agent\\bin\\Release\\net8.0-windows\\win-x64\\publish"
